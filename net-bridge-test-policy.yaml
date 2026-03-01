@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-icmp
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: net-bridge-test
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: ICMP
+

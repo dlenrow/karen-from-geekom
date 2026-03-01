@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vlan52-router
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vlan52-router
+  template:
+    metadata:
+      labels:
+        app: vlan52-router
+    spec:
+      hostNetwork: true  # Enable host networking
+      containers:
+      - name: router-container
+        image: ubuntu:20.04
+        securityContext:
+          privileged: true  # Required to interact with network interfaces
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            apt-get update && apt-get install -y iproute2 iptables vlan \
+            iputils-ping bridge-utils ebtables tcpdump tshark&& \
+            sysctl -w net.ipv4.ip_forward=1 && \
+            ip link show enx_w52 || (echo "Interface enx_w52 not found" && exit 1) && \
+            ip link set enx_w52 up && \
+            ip rule add from 192.168.100.0/24 lookup vlan52_table && \
+            ip route add default via 10.0.0.245  dev cilium_host table vlan52_table && \
+            ip route add 192.168.100.0/24 via 192.168.100.1 dev enx_w52 table vlan52_table && \
+            iptables -t nat -A POSTROUTING -o cilium_host -j MASQUERADE && \
+            iptables -A FORWARD -i enx_w52 -o cilium_host -j ACCEPT && \
+            iptables -A FORWARD -i cilium_host -o enx_w52 -j ACCEPT && \
+            echo "Router pod setup complete" && while true; do sleep 1000; done;
+

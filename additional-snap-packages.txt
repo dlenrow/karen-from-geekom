@@ -1,0 +1,14 @@
+Name                       Version             Rev    Tracking         Publisher    Notes
+bare                       1.0                 5      latest/stable    canonical**  base
+core                       16-2.61.4-20240607  17200  latest/stable    canonical**  core
+core20                     20240911            2434   latest/stable    canonical**  base
+core22                     20241001            1663   latest/stable    canonical**  base
+curl                       8.1.2               1754   latest/stable    woutervb     -
+firefox                    132.0.2-2           5273   latest/stable/…  mozilla**    -
+gnome-3-38-2004            0+git.efb213a       143    latest/stable/…  canonical**  -
+gnome-42-2204              0+git.510a601       176    latest/stable    canonical**  -
+gtk-common-themes          0.1-81-g442e511     1535   latest/stable/…  canonical**  -
+midori                     v8.0-31-gf6b3b1e    550    latest/stable    kalikiana    -
+snap-store                 41.3-72-g80e7130    1216   latest/stable/…  canonical**  -
+snapd                      2.63                21759  latest/stable    canonical**  snapd
+snapd-desktop-integration  0.9                 253    latest/stable/…  canonical**  -

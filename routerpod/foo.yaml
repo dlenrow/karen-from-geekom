@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vlan-52-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vlan-namespace
+      vlan: "52"
+  template:
+    metadata:
+      labels:
+        app: vlan-namespace
+        vlan: "52"
+    spec:
+      hostNetwork: true
+      containers:
+      - name: vlan-namespace
+        image: ubuntu:20.04
+        securityContext:
+          privileged: true
+        env:
+        - name: VLAN_ID
+          value: "52"
+        - name: VLAN_INTERFACE
+          value: "enx_w52"
+        - name: CILIUM_INTERFACE
+          value: "cilium_host"
+        - name: VLAN_SUBNET
+          value: "192.168.100.0/24"
+        - name: VLAN_GATEWAY
+          value: "192.168.100.1"
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apt update && apt install -y iproute2 iptables iputils-ping bridge-utils \
+            ebtables tcpdump tshark
+
+          echo "Creating namespace for VLAN $VLAN_ID"
+          ip netns add vlan-$VLAN_ID
+
+          echo "Moving $VLAN_INTERFACE to namespace vlan-$VLAN_ID"
+          ip link set $VLAN_INTERFACE netns vlan-$VLAN_ID
+          ip netns exec vlan-$VLAN_ID ip link set $VLAN_INTERFACE up
+          ip netns exec vlan-$VLAN_ID ip addr add $VLAN_GATEWAY/24 dev $VLAN_INTERFACE
+
+          echo "Setting up veth pair for namespace communication"
+          ip link add veth-$VLAN_ID type veth peer name veth-$VLAN_ID-cilium
+          ip link set veth-$VLAN_ID netns vlan-$VLAN_ID
+          ip link set veth-$VLAN_ID-cilium up
+          ip addr add 192.168.200.$VLAN_ID/24 dev veth-$VLAN_ID-cilium
+
+          ip netns exec vlan-$VLAN_ID ip link set veth-$VLAN_ID up
+          ip netns exec vlan-$VLAN_ID ip addr add 192.168.200.1/24 dev veth-$VLAN_ID
+
+          echo "Enabling NAT and forwarding in namespace"
+          ip netns exec vlan-$VLAN_ID sysctl -w net.ipv4.ip_forward=1
+          ip netns exec vlan-$VLAN_ID iptables -A FORWARD -i $VLAN_INTERFACE -o veth-$VLAN_ID -j ACCEPT
+          ip netns exec vlan-$VLAN_ID iptables -A FORWARD -i veth-$VLAN_ID -o $VLAN_INTERFACE -m state --state ESTABLISHED,RELATED -j ACCEPT
+          ip netns exec vlan-$VLAN_ID iptables -t nat -A POSTROUTING -o veth-$VLAN_ID -s $VLAN_SUBNET -j MASQUERADE
+
+          echo "Setting up route from veth-$VLAN_ID-cilium to cilium_host"
+          ip route add $VLAN_SUBNET dev veth-$VLAN_ID-cilium
+          iptables -A FORWARD -i veth-$VLAN_ID-cilium -o cilium_host -j ACCEPT
+          iptables -A FORWARD -i cilium_host -o veth-$VLAN_ID-cilium -m state --state ESTABLISHED,RELATED -j ACCEPT
+          iptables -t nat -A POSTROUTING -o cilium_host -s 192.168.200.0/24 -j MASQUERADE
+
+          echo "Namespace setup complete for VLAN $VLAN_ID"
+          sleep infinity
+

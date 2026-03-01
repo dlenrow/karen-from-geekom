@@ -1,0 +1,26 @@
+[connection]
+id=illumio appliance 1
+uuid=d51e3081-4ec9-4d66-8257-d60cab65bb71
+type=wifi
+interface-name=wlo1
+timestamp=1726447744
+
+[wifi]
+mode=infrastructure
+ssid=illumio appliance 1
+
+[wifi-security]
+auth-alg=open
+key-mgmt=wpa-psk
+psk=aaaaaaaa
+
+[ipv4]
+dns=8.8.8.8;8.8.4.4;
+ignore-auto-dns=true
+method=auto
+
+[ipv6]
+addr-gen-mode=default
+method=auto
+
+[proxy]

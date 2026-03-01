@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multus-cni-config
+  namespace: kube-system
+  labels:
+    tier: node
+    app: multus
+data:
+  cni-conf.json: |
+    {
+      "name": "multus-cni-network",
+      "type": "multus",
+      "capabilities": {
+        "portMappings": true
+      },
+      "delegates": [
+        {
+          "cniVersion": "0.3.1",
+          "name": "cilium",
+          "plugins": [
+            {
+              "type": "cilium-cni",
+              "enable-debug": true,
+              "log-file": "/var/run/cilium/cilium-cni.log"
+            }
+          ]
+        }
+      ],
+      "kubeconfig": "/etc/cni/net.d/multus.d/multus.kubeconfig"
+    }
+

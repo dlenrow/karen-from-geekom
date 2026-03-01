@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: net-bridge-test-service
+  labels:
+    app: net-bridge-test
+spec:
+  selector:
+    app: net-bridge-test
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+
+---
+
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: net-bridge-test-service
+subsets:
+  - addresses:
+      - ip: 192.168.1.1
+    ports:
+      - port: 8080
+

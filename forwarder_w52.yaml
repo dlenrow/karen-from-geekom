@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-bridge-deployment
+  namespace: default
+  labels:
+    app: network-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: network-bridge
+  template:
+    metadata:
+      labels:
+        app: network-bridge
+    spec:
+      containers:
+      - name: bridge-container
+        image: ubuntu
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Install necessary packages including tshark
+            apt update && apt install -y iproute2 iptables iputils-ping bridge-utils \
+            ebtables tcpdump tshark
+
+            # Enable IP forwarding
+            echo 1 > /proc/sys/net/ipv4/ip_forward
+
+
+            # Create a bridge interface and add enx_w52 to it
+            # brctl addbr br0
+            # brctl addif br0 enx_w52
+
+            # Set bridge and interfaces up
+            ip link set enx_w52 up
+            ip link set br0 up
+
+            # Apply NAT rule to enable outbound access for bridged traffic
+            iptables -t nat -A POSTROUTING -o enx -j MASQUERADE
+
+            # Keep container running until SIGTERM is received
+            while true; do sleep 1; done
+        securityContext:
+          privileged: true
+      hostNetwork: true
+

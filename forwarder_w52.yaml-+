@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-bridge-deployment
+  namespace: default
+  labels:
+    app: network-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: network-bridge
+  template:
+    metadata:
+      labels:
+        app: network-bridge
+    spec:
+      containers:
+      - name: bridge-container
+        image: ubuntu
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Install necessary packages
+            apt update && apt install -y iproute2 iptables iputils-ping bridge-utils \
+            ebtables tcpdump isc-dhcp-server tshark
+
+            # Enable IP forwarding
+            echo 1 > /proc/sys/net/ipv4/ip_forward
+
+            # Define cleanup function to handle SIGTERM and reset interfaces
+            cleanup() {
+              echo "Caught SIGTERM, cleaning up..."
+              # Move enx_w52 back to default namespace
+              ip netns exec my_ns ip link set enx_w52 netns 1
+              echo "Moved enx_w52 back to default namespace."
+              exit 0
+            }
+
+            # Trap SIGTERM for cleanup
+            trap cleanup SIGTERM
+
+            # Create a veth pair for connecting cni0
+            ip link add veth_cni_ns type veth peer name veth_cni_host
+
+            # Add namespace and move interfaces
+            ip netns add my_ns
+            ip link set veth_cni_ns netns my_ns
+
+            # Enable promiscuous mode on all involved interfaces
+            ip link set enx promisc on
+            ip link set enx_w52 promisc on
+            ip link set veth_cni_host promisc on
+            ip netns exec my_ns ip link set veth_cni_ns promisc on
+
+            # Check if VLAN interface enx_w52 exists
+            if ip link show enx_w52 &> /dev/null; then
+              ip link set enx_w52 netns my_ns
+            else
+              ip link add link enx0 name enx_w52 type vlan id 52
+              ip link set enx_w52 netns my_ns
+              ip netns exec my_ns ip link set enx_w52 up
+              ip netns exec my_ns ip addr add 10.42.52.1/24 dev enx_w52
+            fi
+
+            # Create a bridge in the namespace and add interfaces
+            ip netns exec my_ns brctl addbr br0_ns
+            ip netns exec my_ns brctl addif br0_ns veth_cni_ns
+            ip netns exec my_ns brctl addif br0_ns enx_w52
+
+            # Set interfaces up in the namespace
+            ip netns exec my_ns ip link set enx_w52 up
+            ip netns exec my_ns ip link set veth_cni_ns up
+            ip netns exec my_ns ip link set br0_ns up
+
+            # Set up the veth_cni_host on the host to connect to cni0
+            ip link set veth_cni_host up
+            ip link set veth_cni_host master cni0
+
+            # Add a route in the default namespace for traffic to 10.42.52.0/24 via veth_cni_host
+            ip route add 10.42.52.0/24 dev veth_cni_host
+
+            # Apply NAT rule on host to enable outbound access for namespace
+            iptables -t nat -A POSTROUTING -o enx -j MASQUERADE
+
+            # Setup DHCP server config for clients in my_ns
+            echo "INTERFACESv4='enx_w52'" > /etc/default/isc-dhcp-server
+            cat << EOF | tee /etc/dhcp/dhcpd.conf
+            subnet 10.42.52.0 netmask 255.255.255.0 {
+                range 10.42.52.100 10.42.52.200; 
+                option routers 10.42.52.1;
+                option subnet-mask 255.255.255.0;
+                option domain-name-servers 8.8.8.8, 8.8.4.4;
+                option broadcast-address 10.42.52.255;
+            }
+            EOF
+            touch /var/lib/dhcp/dhcpd.leases
+            chown root:root /var/lib/dhcp/dhcpd.leases
+            chmod 644 /var/lib/dhcp/dhcpd.leases
+
+            # Start DHCP server in my_ns
+            ip netns exec my_ns /usr/sbin/dhcpd -f -d enx_w52
+
+            # Keep container running until SIGTERM is received
+            while true; do sleep 1; done
+        securityContext:
+          privileged: true
+      hostNetwork: true
+

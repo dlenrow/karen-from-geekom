@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: w52-deployment
+  labels:
+    app: vlan52-fw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vlan52-fw
+  template:
+    metadata:
+      labels:
+        app: vlan52-fw
+      annotations:
+        k8s.v1.cni.cncf.io/networks: |
+          [
+            {
+              "name": "vlan52-network",
+              "interfaceRequest": "net1"
+            }
+          ]
+    spec:
+      containers:
+      - name: fw-container
+        image: ubuntu:20.04
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Install required tools
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update && apt-get install -y \
+              iproute2 iptables isc-dhcp-server iputils-ping tcpdump tshark curl jq \
+              && apt-get clean
+
+            # Wait for net1 or move from host namespace
+            if [ -d /sys/class/net/net1 ]; then
+              echo "Interface net1 is ready in pod."
+            elif [ -d /host/sys/class/net/net1 ]; then
+              echo "Moving net1 from host namespace to pod namespace..."
+              ip link set net1 netns /proc/1/ns/net
+              ip addr add 192.168.100.1/24 dev net1
+              ip link set net1 up
+            else
+              echo "Error: Interface net1 not found."
+              exit 1
+            fi
+
+            # Enable IP forwarding
+            sysctl -w net.ipv4.ip_forward=1
+
+            # Configure DHCP server
+            echo "INTERFACESv4='net1'" > /etc/default/isc-dhcp-server
+            cat <<EOF > /etc/dhcp/dhcpd.conf
+            subnet 192.168.100.0 netmask 255.255.255.0 {
+                range 192.168.100.100 192.168.100.200;
+                option routers 192.168.100.1;
+                option subnet-mask 255.255.255.0;
+                option domain-name-servers 8.8.8.8, 8.8.4.4;
+            }
+            EOF
+            service isc-dhcp-server start || (echo "DHCP server failed to start" && exit 1)
+
+            # Keep container running
+            tail -f /dev/null
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-sys
+          mountPath: /host/sys
+          readOnly: true
+      volumes:
+      - name: host-sys
+        hostPath:
+          path: /sys
+

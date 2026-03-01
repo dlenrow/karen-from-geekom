@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dhcp-nat-vlan-52
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dhcp-nat
+      vlan: "52"
+  template:
+    metadata:
+      labels:
+        app: dhcp-nat
+        vlan: "52"
+    spec:
+      hostNetwork: true
+      containers:
+        - name: dhcp-nat
+        image: ubuntu:20.04
+        command: ["/bin/bash", "-c"]
+	args:
+	  - |
+	    apt update && apt install -y iproute2 iptables iputils-ping bridge-utils \
+	      ebtables tcpdump tshark
+	    ip addr add 192.168.100.0/24 dev enx_w52
+	    ip link set enx__w52 up
+	    # setup dhcp server config
+	    echo "INTERFACESv4='enx_w52'" > /etc/default/isc-dhcp-server
+	    cat << EOF | tee /etc/dhcp/dhcpd.conf
+	    subnet  192.168.100.0 netmask 255.255.255.0 {
+		range 192.169.100.100 192.169.100.200;
+		option routers 192.168.100.1;
+		option subnet-mask 255.255.255.0;
+		option domain-name-servers 8.8.8.8, 8.8.4.4;
+		option broadcast-address 192.168.100.255;
+	    }
+	    EOF
+	    touch /var/lib/dhcp/dhcpd.leases
+	    chown root:root /var/lib/dhcp/dhcpd.leases
+	    chmod 644 /var/lib/dhcp/dhcpd.leases
+
+	    service isc-dhcp-server start
+
+	    # Enable IP forwarding
+	    sysctl -w net.ipv4.ip_forward=1
+
+	    # Configure NAT and forwarding
+	    iptables -A FORWARD -i enx_w52 -o cilium_host -j ACCEPT
+	    iptables -A FORWARD -i cilium_host -o enx_w52 -m state \
+	      --state ESTABLISHED,RELATED -j ACCEPT
+	    #
+	    iptables -t nat -A POSTROUTING -o cilium_host -s 192.168.100.0/24 \
+	      -j MASQUERADE
+	    #
+	    tail -f /var/log/syslog

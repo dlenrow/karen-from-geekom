@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vlan53-deployment
+  labels:
+    app: vlan53-fw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vlan53-fw
+  template:
+    metadata:
+      labels:
+        app: vlan53-fw
+      annotations:
+        k8s.v1.cni.cncf.io/networks: |
+          [
+            {
+              "name": "vlan53-network",
+              "interfaceRequest": "net1"
+            }
+          ]
+    spec:
+      containers:
+      - name: fw-container
+        image: ubuntu:20.04
+        securityContext:
+          appArmorProfile: unconfined # This replaces the deprecated annotation
+
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Install required tools
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update && apt-get install -y \
+              iproute2 iptables isc-dhcp-server iputils-ping tcpdump tshark curl jq \
+              && apt-get clean
+
+            echo "Configuring VLAN interface net1..."
+
+            # Configure VLAN 53 (net1) with gateway IP
+            ip addr add 192.168.101.1/24 dev net1
+            ip link set net1 up
+
+            echo "Enabling ARP proxy on net1..."
+            sysctl -w net.ipv4.conf.net1.proxy_arp=1
+            sysctl -w net.ipv4.conf.all.proxy_arp=1
+
+            echo "Setting up NAT and forwarding rules..."
+
+            # Enable IP forwarding
+            sysctl -w net.ipv4.ip_forward=1
+
+            # NAT for VLAN 53 traffic via eth0
+            iptables -A FORWARD -i net1 -o eth0 -j ACCEPT
+            iptables -A FORWARD -i eth0 -o net1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+            iptables -t nat -A POSTROUTING -o eth0 -s 192.168.101.0/24 -j MASQUERADE
+
+            echo "Configuring DHCP server for VLAN 53..."
+
+            # Configure DHCP server for VLAN 53
+            echo "INTERFACESv4='net1'" > /etc/default/isc-dhcp-server
+            cat <<EOF > /etc/dhcp/dhcpd.conf
+            subnet 192.168.101.0 netmask 255.255.255.0 {
+                range 192.168.101.100 192.168.101.200;
+                option routers 192.168.101.1;
+                option subnet-mask 255.255.255.0;
+                option domain-name-servers 8.8.8.8, 8.8.4.4;
+            }
+            EOF
+
+            service isc-dhcp-server start || (echo "DHCP server failed to start" && exit 1)
+
+            echo "Starting tcpdump to monitor ARP and DHCP traffic..."
+
+            # Run tcpdump to capture traffic on net1 and save it to host path
+            mkdir -p /host/tmp/tcpdump
+            tcpdump -i net1 -w /host/tmp/tcpdump/vlan53_traffic.pcap &
+
+            echo "Configuration completed. Keeping container running..."
+            tail -f /dev/null
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - name: tcpdump-dir
+            mountPath: /host/tmp/tcpdump
+      volumes:
+        - name: tcpdump-dir
+          hostPath:
+            path: /tmp/tcpdump
+            type: DirectoryOrCreate
+

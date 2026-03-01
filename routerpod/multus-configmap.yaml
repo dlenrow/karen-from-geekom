@@ -1,0 +1,48 @@
+apiVersion: v1
+data:
+  cni-conf.json: |
+    {
+      "name": "multus-cni-network",
+      "type": "multus",
+      "capabilities": {
+        "portMappings": true
+      },
+      "delegates": [
+        {
+          "cniVersion": "0.3.1",
+          "name": "default-cni-network",
+          "plugins": [
+            {
+              "type": "cilium-cni",
+              "name": "cilium",
+              "enable-debug": true,
+              "delegate": {
+                "isDefaultGateway": true,
+                "hairpinMode": true
+              }
+            },
+            {
+              "type": "portmap",
+              "capabilities": {
+                "portMappings": true
+              }
+            }
+          ]
+        }
+      ],
+      "kubeconfig": "/etc/cni/net.d/multus.d/multus.kubeconfig"
+    }
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"cni-conf.json":"{\n  \"name\": \"multus-cni-network\",\n  \"type\": \"multus\",\n  \"capabilities\": {\n    \"portMappings\": true\n  },\n  \"delegates\": [\n    {\n      \"cniVersion\": \"0.3.1\",\n      \"name\": \"default-cni-network\",\n      \"plugins\": [\n        {\n          \"type\": \"cilium-cni\",\n          \"name\": \"cilium\",\n          \"enable-debug\": true,\n          \"delegate\": {\n            \"isDefaultGateway\": true,\n            \"hairpinMode\": true\n          }\n        },\n        {\n          \"type\": \"portmap\",\n          \"capabilities\": {\n            \"portMappings\": true\n          }\n        }\n      ]\n    }\n  ],\n  \"kubeconfig\": \"/etc/cni/net.d/multus.d/multus.kubeconfig\"\n}\n"},"kind":"ConfigMap","metadata":{"annotations":{},"labels":{"app":"multus","tier":"node"},"name":"multus-cni-config","namespace":"kube-system"}}
+  creationTimestamp: "2024-12-09T17:15:06Z"
+  labels:
+    app: multus
+    tier: node
+  name: multus-cni-config
+  namespace: kube-system
+  resourceVersion: "112640"
+  uid: 53fc5e0f-957c-4119-a4ff-04e09a4a65a2
+

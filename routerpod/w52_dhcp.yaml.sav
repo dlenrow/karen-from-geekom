@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vlan52-deployment
+  labels:
+    app: vlan52-fw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vlan52-fw
+  template:
+    metadata:
+      labels:
+        app: vlan52-fw
+      annotations:
+        k8s.v1.cni.cncf.io/networks: |
+          [
+            {
+              "name": "vlan52-network",
+              "interfaceRequest": "net1"
+            }
+          ]
+    spec:
+      containers:
+      - name: fw-container
+        image: ubuntu:20.04
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Install required tools
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update && apt-get install -y \
+              iproute2 iptables isc-dhcp-server iputils-ping tcpdump tshark curl jq \
+              && apt-get clean
+
+            echo "Configuring VLAN interfaces..."
+
+            # Configure VLAN 52 (net1)
+            ip addr add 192.168.100.1/24 dev net1
+            ip link set net1 up
+
+
+
+            echo "Setting up policy-based routing for VLANs..."
+
+            # Add routing table for VLAN 52
+            echo "200 vlan52" >> /etc/iproute2/rt_tables
+            ip rule add from 192.168.100.0/24 table vlan52
+            ip route add 192.168.100.0/24 via 192.168.100.1  dev net1 table vlan52
+            ip route add default via eth0 table vlan52
+
+
+            echo "Enabling IP forwarding..."
+            sysctl -w net.ipv4.ip_forward=1
+
+            echo "Setting up NAT and forwarding rules..."
+
+            # NAT for VLAN 52 traffic via cilium_host
+            iptables -A FORWARD -i net1 -o eth0 -j ACCEPT
+            iptables -A FORWARD -i eth0 -o net1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+            iptables -t nat -A POSTROUTING -o eth0 -s 192.168.100.0/24 -j MASQUERADE
+
+            echo "Configuring DHCP server for VLAN 52..."
+
+            # Configure DHCP server for VLAN 52
+            echo "INTERFACESv4='net1'" > /etc/default/isc-dhcp-server
+            cat <<EOF > /etc/dhcp/dhcpd.conf
+            subnet 192.168.100.0 netmask 255.255.255.0 {
+                range 192.168.100.100 192.168.100.200;
+                option routers 192.168.100.1;
+                option subnet-mask 255.255.255.0;
+                option domain-name-servers 8.8.8.8, 8.8.4.4;
+            }
+            EOF
+
+            service isc-dhcp-server start || (echo "DHCP server failed to start" && exit 1)
+
+            echo "Configuration completed. Keeping container running..."
+            tail -f /dev/null
+        securityContext:
+          privileged: true
+

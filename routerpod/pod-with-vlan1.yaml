@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-vlan1
+  annotations:
+    k8s.v1.cni.cncf.io/networks: vlan1-network
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command:
+      - sleep
+      - "3600"
+    securityContext:
+      privileged: true
+

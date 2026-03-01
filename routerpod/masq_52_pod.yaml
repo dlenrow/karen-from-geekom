@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vlan-52-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vlan-namespace
+      vlan: "52"
+  template:
+    metadata:
+      labels:
+        app: vlan-namespace
+        vlan: "52"
+    spec:
+      hostNetwork: true
+      containers:
+      - name: vlan-namespace
+        image: ubuntu:20.04
+        securityContext:
+          privileged: true
+        env:
+        - name: VLAN_ID
+          value: "52"
+        - name: VLAN_INTERFACE
+          value: "enx_w52"
+        - name: CILIUM_INTERFACE
+          value: "cilium_host"
+        - name: VLAN_SUBNET
+          value: "192.168.100.0/24"
+        - name: VLAN_GATEWAY
+          value: "192.168.100.1"
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Updating and installing required packages"
+          apt-get update && apt-get install -y iproute2 iptables
+
+          echo "Creating namespace for VLAN $VLAN_ID"
+          ip netns add vlan-$VLAN_ID
+
+          echo "Moving $VLAN
+

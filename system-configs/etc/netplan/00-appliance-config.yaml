@@ -1,0 +1,32 @@
+network:
+  version: 2
+  renderer: networkd
+
+  ethernets:
+    enx:
+      match:
+        macaddress: 84:47:09:33:c9:d9  # Replace with the actual MAC address for enp1s0
+      set-name: enx
+      dhcp4: true  # Get IPv4 address via DHCP
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 8.8.4.4
+#      dhcp4-overrides:
+#        use-routes: false  # Prevents default route from being added
+
+    enx0:
+      match:
+        macaddress: 84:47:09:33:c9:da  # Replace with the actual MAC address for enp2s0
+      set-name: enx0
+      addresses: [192.168.50.1/24]  # Static address for enx0
+
+  wifis:
+    wlo1:  # Wi-Fi interface (adjust if necessary)
+      dhcp4: true
+      dhcp4-overrides:
+        use-routes: false  # Prevents default route from being added
+      access-points:
+        "Verizon_G9VSZJ":
+          password: "mod3-moose-slab"
+

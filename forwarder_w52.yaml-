@@ -1,0 +1,106 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-bridge-deployment
+  namespace: default
+  labels:
+    app: network-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: network-bridge
+  template:
+    metadata:
+      labels:
+        app: network-bridge
+    spec:
+      containers:
+      - name: bridge-container
+        image: ubuntu
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Install necessary packages
+            apt update && apt install -y iproute2 iptables iputils-ping bridge-utils \
+            ebtables tcpdump isc-dhcp-server
+
+            # Enable IP forwarding
+            echo 1 > /proc/sys/net/ipv4/ip_forward
+
+            # Create veth pairs
+            ip link add veth_cni_ns type veth peer name veth_cni_host
+
+            # Add the namespace
+            ip netns add my_ns
+            ip link set veth_cni_ns netns my_ns
+
+            # Check if VLAN interface enx_w52 exists
+            if ip link show enx_w52 &> /dev/null; then
+              # If it exists, move it to the private namespace
+              ip link set enx_w52 netns my_ns
+            else
+              # If it doesn't exist, create it in the private namespace
+              echo "VLAN interface enx_w52 does not exist; creating it in my_ns"
+  
+              # Create enx_w52 as a VLAN interface on top of the primary interface (e.g., enx0)
+              ip link add link enx0 name enx_w52 type vlan id 52
+  
+              ip netns exec my_ns ip addr add 10.42.52.1/24 dev enx_w52
+              ip netns exec my_ns ip link set enx_w52 up
+
+              # Move the newly created VLAN interface to my_ns
+              ip link set enx_w52 netns my_ns
+            fi
+
+            # Create a bridge in the namespace and add interfaces
+            ip netns exec my_ns brctl addbr br0_ns
+            ip netns exec my_ns brctl addif br0_ns veth_cni_ns
+            ip netns exec my_ns brctl addif br0_ns enx_w52
+
+            # Set interfaces up and enable promiscuous mode in the namespace
+            ip netns exec my_ns ip link set veth_cni_ns up
+            ip netns exec my_ns ip link set veth_cni_ns promisc on
+            ip netns exec my_ns ip link set enx_w52 up
+            ip netns exec my_ns ip link set enx_w52 promisc on
+            ip netns exec my_ns ip link set br0_ns up
+            ip netns exec my_ns ip link set br0_ns promisc on
+
+            # Set host-side interfaces up and enable promiscuous mode
+            ip link set veth_cni_host up
+            ip link set veth_cni_host promisc on
+            ip link set cni0 promisc on
+
+            # Attach veth host-side interface to the CNI bridge
+            ip link set veth_cni_host master cni0
+
+            # setup dhcp server config
+            echo "INTERFACESv4='enx_w52'" > /etc/default/isc-dhcp-server
+            cat << EOF | tee /etc/dhcp/dhcpd.conf
+            subnet 10.42.52.0 netmask 255.255.255.0 {
+                range 10.42.52.100 10.42.52.200;    # IP range to assign to clients
+                option routers 10.42.52.1;          # Gateway IP
+                option subnet-mask 255.255.255.0;
+                option domain-name-servers 8.8.8.8, 8.8.4.4;  # Google DNS servers
+                option broadcast-address 10.42.52.255;
+            }
+            EOF
+            touch /var/lib/dhcp/dhcpd.leases
+            chown root:root /var/lib/dhcp/dhcpd.leases
+            chmod 644 /var/lib/dhcp/dhcpd.leases
+
+            ip netns exec my_ns ip addr add 10.42.52.1/24 dev enx_w52
+
+            ip netns exec my_ns /usr/sbin/dhcpd -f -d enx_w52
+            
+            #  make sure off-net traffic gets routed to the internet correctly
+            ip netns exec my_ns ip route add default via 10.42.52.1 dev br0_ns
+
+            # Keep container running until SIGTERM is received
+            trap "exit 0" SIGTERM
+            while true; do sleep 1; done
+        securityContext:
+          privileged: true
+      hostNetwork: true
+
