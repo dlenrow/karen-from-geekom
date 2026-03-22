@@ -158,6 +158,36 @@ Client request:
 Every hop: authenticated, encrypted, authorized, audited.
 ```
 
+## Transport Security: Two Layers
+
+### Decision 5: mTLS for API path, IPsec for RDMA bulk
+
+**Context:** IPsec encrypts the pipe (node-to-node). mTLS encrypts the
+conversation (per-connection, per-identity). LLM inference turns need
+identity-bound, per-request auth — not just encrypted packets.
+
+**Decision:** Use **mTLS** for the inference API path (user ↔ frontend ↔ GPU
+TEE). Use **IPsec** for inter-node RDMA (KV cache bulk transfer).
+
+```
+Client ──[mTLS/TLS 1.3]──► BF-3 Frontend (port 8000)
+  │ Per-turn: client SVID verified, L7 policy, Hubble audit
+  │ Prompt encrypted to service identity, not just to node
+  │ Client cert carries tenant claims, individually revocable
+  │
+BF-3 ──[IPsec, ConnectX HW offload]──► BF-3 (RDMA KV cache)
+  │ Bulk: node-to-node, 400Gb/s, hardware AES-256-GCM
+  │ No per-request overhead, ibverbs policed by CNPs
+```
+
+**Why mTLS for API, not IPsec:**
+- Per-connection identity (SPIFFE SVID) vs per-node SA
+- L7 visibility — Cilium/Envoy can inspect HTTP method/path/headers
+- Per-tenant rate limiting keyed on client cert
+- Individual revocation without tearing down all traffic
+- Hubble records who asked what (metadata, not content)
+- Client attestation via cert claims
+
 ## Security Layers
 
 | Layer | Technology | Enforcement Point |
@@ -166,10 +196,11 @@ Every hop: authenticated, encrypted, authorized, audited.
 | 2. Identity | SPIFFE/SPIRE + DICE certs | foil-cilium mTLS |
 | 3. Network Policy | foil-cilium CNPs (default-deny) | eBPF on representor ports |
 | 4. RDMA Policy | foil-cilium ibverbs policing | eBPF datapath |
-| 5. Encryption | IPsec (Cilium + ConnectX HW offload) | NIC hardware |
-| 6. DMA Firewall | DOCA Flow rules | NIC firmware |
-| 7. GPU Protection | CC TEE (H200 CPR) | GPU hardware |
-| 8. Observability | Hubble RDMA flows + Prometheus | eBPF datapath |
+| 5. API Encryption | mTLS / TLS 1.3 (per-connection) | Cilium L7 proxy |
+| 6. RDMA Encryption | IPsec (Cilium + ConnectX HW offload) | NIC hardware |
+| 7. DMA Firewall | DOCA Flow rules | NIC firmware |
+| 8. GPU Protection | CC TEE (H200 CPR) | GPU hardware |
+| 9. Observability | Hubble (L7 + RDMA flows) + Prometheus | eBPF datapath |
 
 ## Software Stack
 

@@ -4,6 +4,30 @@ Reverse-chronological log of architectural decisions and pivots.
 
 ---
 
+## 2026-03-22: mTLS for inference API, IPsec for RDMA bulk
+
+**Question:** What encryption for user ↔ GPU TEE inference turns?
+
+**Decision:** mTLS (TLS 1.3 with client certs) for the inference API path.
+IPsec stays for inter-node RDMA KV cache transfer.
+
+**Rationale:** IPsec encrypts the pipe (node-to-node). mTLS encrypts the
+conversation (per-connection, per-identity). For LLM turns:
+- Client presents SPIFFE SVID — identity-bound, revocable, carries tenant claims
+- L7 visible to Cilium/Envoy — can enforce per-route, per-method policy
+- Hubble records who asked what (method, path, client ID) without seeing prompt content
+- Per-tenant rate limiting keyed on client cert identity
+- Individual client revocation without tearing down all traffic
+
+IPsec stays for RDMA because:
+- KV cache transfer is bulk, node-to-node, not per-request
+- ConnectX-7 hardware offloads AES-256-GCM at line rate
+- ibverbs policing via CNPs handles the access control layer
+
+**Files:** cnp-inference-api-mtls.yaml, dynamo-bf3-config.yaml (security.mtls section)
+
+---
+
 ## 2026-03-22: BF-2 viable for dev/debug
 
 **Question:** Can we develop on BF-2 (available in home lab) instead of BF-3?

@@ -170,20 +170,52 @@ dynamo:
       provider: "spiffe"
       workload_api_socket: "/run/spire/sockets/agent.sock"
       trust_domain: "inference.cluster.local"
-      # mTLS for all inter-node communication
-      mtls:
-        enabled: true
-        # SVID used as client/server cert for all connections
-        require_peer_svid: true
 
-    # Encrypted RDMA: foil-cilium transparent IPsec (or DOCA inline)
+    # --- Transport Security (two layers) ---
+
+    # Layer A: mTLS for inference API path (user ↔ frontend ↔ GPU TEE)
+    # Per-connection identity, per-turn auth, L7 visible to Hubble/Envoy.
+    # Client presents SPIFFE SVID — identity-bound, revocable, carries claims.
+    # This is the right encryption for LLM conversation turns over HTTP API.
+    mtls:
+      enabled: true
+      # SVID used as client/server cert for all API connections
+      require_peer_svid: true
+      # Minimum TLS version
+      min_version: "1.3"
+      # Cipher suites (TLS 1.3 — all use AEAD)
+      cipher_suites:
+        - "TLS_AES_256_GCM_SHA384"
+        - "TLS_CHACHA20_POLY1305_SHA256"
+      # Client certificate verification
+      client_auth: "require_and_verify"
+      # Apply to these endpoints:
+      endpoints:
+        # Inference API — every turn is mTLS authenticated
+        - service: "frontend"
+          port: 8000
+          require_client_cert: true
+        # Control plane inter-service
+        - service: "request_plane"
+          port: 8001
+          require_client_cert: true
+        - service: "event_plane"
+          port: 8002
+          require_client_cert: true
+
+    # Layer B: IPsec for inter-node RDMA (KV cache bulk transfer)
+    # Node-to-node, hardware-offloaded on ConnectX-7, high throughput.
+    # Not per-connection — encrypts the pipe between BF-3 nodes.
+    # Right encryption for bulk KV cache RDMA (WRITE/SEND at 400Gb/s).
     encrypted_rdma:
       enabled: true
       # foil-cilium manages IPsec SAs between nodes
       # ConnectX-7 hardware offloads AES-256-GCM
-      # Fallback: DOCA IPsec inline via /etc/ipsec/doca-ipsec-config.yaml
       provider: "cilium"
       reject_cleartext: true
+      # IPsec applies ONLY to inter-node RDMA (RoCE v2 / UDP 4791)
+      # mTLS handles the API path separately
+      scope: "rdma_only"
 
     # DMA firewall: DOCA Flow rules
     dma_firewall:
