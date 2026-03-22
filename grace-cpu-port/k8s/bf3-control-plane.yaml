@@ -1,60 +1,90 @@
-# Dynamo Control Plane deployment on BF-3 Grace CPU nodes
-# Runs router, planner, KVBM, and connection manager on ARM64
+# Dynamo full-stack deployment on BF-3 SH nodes
+# Each BF-3 SH node is a complete inference node:
+#   - ARM cores run control plane + inference workers
+#   - GPU on PCIe root complex runs CUDA kernels
+#   - ConnectX-7 handles inter-node RDMA
+#
+# For multi-node disaggregated inference: deploy on multiple BF-3 SH nodes
+# with some running prefill and others running decode.
+
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
-  name: dynamo-control-plane
+  name: dynamo-bf3sh-node
   namespace: dynamo-inference
   labels:
     app: dynamo
-    component: control-plane
-    hardware: bf3-grace
+    component: bf3sh-node
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: dynamo
-      component: control-plane
+      component: bf3sh-node
   template:
     metadata:
       labels:
         app: dynamo
-        component: control-plane
-        hardware: bf3-grace
+        component: bf3sh-node
     spec:
-      # Schedule ONLY on BF-3 Grace CPU nodes
+      # Schedule ONLY on BF-3 SH nodes (ARM64 with GPU)
       nodeSelector:
-        nvidia.com/dpu: "bf3"
+        nvidia.com/dpu: "bf3-sh"
         kubernetes.io/arch: "arm64"
       tolerations:
         - key: "nvidia.com/dpu"
           operator: "Equal"
-          value: "bf3"
+          value: "bf3-sh"
           effect: "NoSchedule"
 
-      # Host networking for RDMA access
+      # Host networking for RDMA + low latency
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
 
+      # Init container: verify GPU + GPUDirect RDMA
+      initContainers:
+        - name: verify-gpu
+          image: dynamo-bf3sh:arm64
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "Verifying GPU on BF-3 PCIe root complex..."
+              nvidia-smi || { echo "FAIL: GPU not visible"; exit 1; }
+              echo "GPU OK"
+              # Verify GPUDirect RDMA
+              lsmod | grep nvidia_peermem || modprobe nvidia-peermem || echo "WARN: nvidia-peermem not loaded"
+          securityContext:
+            privileged: true
+
       containers:
-        # --- Dynamo Router ---
-        - name: dynamo-router
-          image: dynamo-cp:arm64
-          command: ["dynamo-router"]
+        # --- Single container runs full Dynamo stack ---
+        # Control plane + inference workers in one process tree
+        # CPU affinity isolates them on 16 cores
+        - name: dynamo-node
+          image: dynamo-bf3sh:arm64
+          command: ["/opt/dynamo/bin/dynamo-serve"]
           args:
             - "--config=/etc/dynamo/dynamo-bf3-config.yaml"
-            - "--bind=0.0.0.0:8000"
+            - "--nixl-config=/etc/nixl/nixl-bf3-config.yaml"
           ports:
-            - name: http
+            - name: frontend
               containerPort: 8000
-              protocol: TCP
+            - name: request-plane
+              containerPort: 8001
+            - name: event-plane
+              containerPort: 8002
+            - name: metrics
+              containerPort: 9400
           resources:
             requests:
-              cpu: "4"
-              memory: "8Gi"
+              cpu: "14"        # 14 of 16 cores (2 for OS/system)
+              memory: "24Gi"   # 24GB of ~32GB DDR5
+              nvidia.com/gpu: "1"
             limits:
-              cpu: "8"
-              memory: "16Gi"
+              cpu: "16"
+              memory: "28Gi"
+              nvidia.com/gpu: "1"
+          securityContext:
+            privileged: true   # Required for RDMA, GPUDirect, hugepages
           volumeMounts:
             - name: dynamo-config
               mountPath: /etc/dynamo
@@ -62,155 +92,145 @@ spec:
               mountPath: /etc/nixl
             - name: hugepages
               mountPath: /dev/hugepages
+            - name: infiniband
+              mountPath: /dev/infiniband
           env:
-            - name: DYN_DISCOVERY_BACKEND
-              value: "kubernetes"
+            # GPU on PCIe root complex
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            # ConnectX-7 RDMA
             - name: UCX_NET_DEVICES
               value: "mlx5_0:1"
             - name: UCX_TLS
               value: "rc_mlx5,cuda_copy"
+            # NIXL / UCX libs
             - name: LD_LIBRARY_PATH
-              value: "/opt/nixl/lib:/opt/ucx/lib"
-
-        # --- Dynamo Planner / Autoscaler ---
-        - name: dynamo-planner
-          image: dynamo-cp:arm64
-          command: ["dynamo-planner"]
-          args:
-            - "--config=/etc/dynamo/dynamo-bf3-config.yaml"
-          resources:
-            requests:
-              cpu: "2"
-              memory: "4Gi"
-            limits:
-              cpu: "4"
-              memory: "8Gi"
-          volumeMounts:
-            - name: dynamo-config
-              mountPath: /etc/dynamo
-
-        # --- KVBM (KV Block Manager) ---
-        - name: dynamo-kvbm
-          image: dynamo-cp:arm64
-          command: ["dynamo-kvbm"]
-          args:
-            - "--config=/etc/dynamo/dynamo-bf3-config.yaml"
-          resources:
-            requests:
-              cpu: "4"
-              memory: "16Gi"
-            limits:
-              cpu: "8"
-              memory: "64Gi"   # Grace LPDDR5X for KV cache spillover
-          volumeMounts:
-            - name: dynamo-config
-              mountPath: /etc/dynamo
-            - name: nixl-config
-              mountPath: /etc/nixl
-            - name: hugepages
-              mountPath: /dev/hugepages
-            - name: bf3-nvme
-              mountPath: /mnt/bf3-nvme
-          env:
-            - name: UCX_NET_DEVICES
-              value: "mlx5_0:1"
-            - name: UCX_TLS
-              value: "rc_mlx5,cuda_copy"
+              value: "/opt/nixl/lib:/opt/ucx/lib:/usr/local/cuda/lib64"
+            # CPU affinity (set in config, reinforced here)
+            - name: DYNAMO_CONTROL_CPUS
+              value: "0-3"
+            - name: DYNAMO_WORKER_CPUS
+              value: "4-13"
+            - name: DYNAMO_SYSTEM_CPUS
+              value: "14-15"
 
       volumes:
         - name: dynamo-config
           configMap:
-            name: dynamo-bf3-config
+            name: dynamo-bf3sh-config
         - name: nixl-config
           configMap:
-            name: nixl-bf3-config
+            name: nixl-bf3sh-config
         - name: hugepages
           emptyDir:
-            medium: HugePages
-        - name: bf3-nvme
+            medium: HugePages-2Mi
+        - name: infiniband
           hostPath:
-            path: /mnt/bf3-nvme
+            path: /dev/infiniband
             type: DirectoryOrCreate
 ---
-# Service for control plane access
 apiVersion: v1
 kind: Service
 metadata:
-  name: dynamo-control-plane
+  name: dynamo-bf3sh
   namespace: dynamo-inference
   labels:
     app: dynamo
-    component: control-plane
 spec:
   type: ClusterIP
   selector:
     app: dynamo
-    component: control-plane
+    component: bf3sh-node
   ports:
     - name: frontend
       port: 8000
       targetPort: 8000
     - name: request-plane
-      port: 9100
-      targetPort: 9100
-    - name: event-pub
-      port: 9200
-      targetPort: 9200
-    - name: event-sub
-      port: 9201
-      targetPort: 9201
-    - name: health
-      port: 9300
-      targetPort: 9300
+      port: 8001
+      targetPort: 8001
+    - name: event-plane
+      port: 8002
+      targetPort: 8002
     - name: metrics
       port: 9400
       targetPort: 9400
 ---
-# ConfigMap: Dynamo config
+# ConfigMap: Dynamo config for BF-3 SH
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: dynamo-bf3-config
+  name: dynamo-bf3sh-config
   namespace: dynamo-inference
 data:
   dynamo-bf3-config.yaml: |
-    # Inline from grace-cpu-port/dynamo/dynamo-bf3-config.yaml
-    # See that file for full configuration reference
     dynamo:
-      cluster_name: "bf3-disagg-inference"
+      cluster_name: "bf3sh-inference"
       frontend:
         host: "0.0.0.0"
         port: 8000
+        max_concurrent_requests: 256
       router:
         type: "kv_aware"
         config:
           prefix_aware: true
           disaggregated: true
+      kvbm:
+        tiers:
+          - name: "gpu_hbm"
+            type: "vram"
+          - name: "bf3_ddr5"
+            type: "host"
+            capacity_gb: 24
+      workers:
+        prefill:
+          engine: "sglang"
+          gpu_devices: [0]
+          cpu_affinity: "4-13"
+        decode:
+          engine: "sglang"
+          gpu_devices: [0]
+          cpu_affinity: "4-13"
+        mode: "colocated"
       discovery:
         backend: "kubernetes"
       request_plane:
         transport: "tcp"
-        bind_address: "0.0.0.0"
-        port: 9100
+        port: 8001
       event_plane:
         transport: "zmq"
-        bind_address: "0.0.0.0"
-        port: 9200
+        port: 8002
+      gpu:
+        cuda_visible_devices: "0"
 ---
-# ConfigMap: NIXL config
+# ConfigMap: NIXL config for BF-3 SH
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: nixl-bf3-config
+  name: nixl-bf3sh-config
   namespace: dynamo-inference
 data:
   nixl-bf3-config.yaml: |
     nixl:
       agent:
-        name: "bf3-nixl-agent"
+        name: "bf3sh-nixl-agent"
       backends:
         - type: ucx
           priority: 1
           config:
             net_devices: "mlx5_0:1"
             tls: "rc_mlx5,cuda_copy"
+            gpu_direct_rdma: true
+        - type: gdaki
+          priority: 2
+          config:
+            doca_device: "mlx5_0"
+      memory:
+        gpu_mem:
+          type: "VRAM"
+          registration: "on_init"
+        host_mem:
+          type: "DRAM"
+          registration: "on_init"
+      tuning:
+        max_concurrent_ops: 32
+        cpu_affinity: "14-15"

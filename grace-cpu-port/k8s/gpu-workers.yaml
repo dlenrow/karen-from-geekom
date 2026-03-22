@@ -1,97 +1,118 @@
-# GPU inference workers — these run on GPU nodes (x86 or Grace Blackwell)
-# They connect to the BF-3 control plane for routing and KV cache management
+# Multi-node disaggregated inference across BF-3 SH nodes
+#
+# In a multi-node setup, BF-3 SH nodes specialize:
+#   - Some nodes run prefill workers
+#   - Some nodes run decode workers
+#   - Each node has its own GPU on PCIe root complex
+#   - NIXL handles KV cache transfer GPU↔GPU via ConnectX-7 RDMA
+#
+# This manifest is for MULTI-NODE deployments.
+# For single-node, use bf3-control-plane.yaml (colocated mode).
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dynamo-prefill-workers
+  name: dynamo-bf3sh-prefill
   namespace: dynamo-inference
   labels:
     app: dynamo
-    component: prefill-worker
+    component: prefill
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dynamo
+      component: prefill
+  template:
+    metadata:
+      labels:
+        app: dynamo
+        component: prefill
+        dynamo.nvidia.com/role: "prefill"
+    spec:
+      nodeSelector:
+        nvidia.com/dpu: "bf3-sh"
+        kubernetes.io/arch: "arm64"
+        dynamo.nvidia.com/role: "prefill"
+      hostNetwork: true
+      containers:
+        - name: prefill-worker
+          image: dynamo-bf3sh:arm64
+          command: ["/opt/dynamo/bin/dynamo-serve"]
+          args:
+            - "--config=/etc/dynamo/dynamo-bf3-config.yaml"
+            - "--role=prefill"
+          resources:
+            requests:
+              cpu: "14"
+              memory: "24Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: "28Gi"
+              nvidia.com/gpu: "1"
+          securityContext:
+            privileged: true
+          env:
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: UCX_NET_DEVICES
+              value: "mlx5_0:1"
+            - name: UCX_TLS
+              value: "rc_mlx5,cuda_copy"
+            - name: LD_LIBRARY_PATH
+              value: "/opt/nixl/lib:/opt/ucx/lib:/usr/local/cuda/lib64"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamo-bf3sh-decode
+  namespace: dynamo-inference
+  labels:
+    app: dynamo
+    component: decode
 spec:
   replicas: 2
   selector:
     matchLabels:
       app: dynamo
-      component: prefill-worker
+      component: decode
   template:
     metadata:
       labels:
         app: dynamo
-        component: prefill-worker
-        dynamo.nvidia.com/role: "prefill"
-    spec:
-      nodeSelector:
-        nvidia.com/gpu.present: "true"
-      containers:
-        - name: prefill
-          image: nvcr.io/nvidia/dynamo:latest
-          command: ["dynamo-worker"]
-          args:
-            - "--role=prefill"
-            - "--engine=sglang"
-            - "--control-plane=dynamo-control-plane.dynamo-inference.svc:9100"
-          resources:
-            requests:
-              nvidia.com/gpu: "1"
-              cpu: "8"
-              memory: "32Gi"
-            limits:
-              nvidia.com/gpu: "1"
-              cpu: "16"
-              memory: "64Gi"
-          env:
-            - name: NIXL_METADATA_BACKEND
-              value: "kubernetes"
-            - name: UCX_NET_DEVICES
-              value: "mlx5_0:1"
-            - name: UCX_TLS
-              value: "rc_mlx5,cuda_copy,cuda_ipc"
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: dynamo-decode-workers
-  namespace: dynamo-inference
-  labels:
-    app: dynamo
-    component: decode-worker
-spec:
-  replicas: 4
-  selector:
-    matchLabels:
-      app: dynamo
-      component: decode-worker
-  template:
-    metadata:
-      labels:
-        app: dynamo
-        component: decode-worker
+        component: decode
         dynamo.nvidia.com/role: "decode"
     spec:
       nodeSelector:
-        nvidia.com/gpu.present: "true"
+        nvidia.com/dpu: "bf3-sh"
+        kubernetes.io/arch: "arm64"
+        dynamo.nvidia.com/role: "decode"
+      hostNetwork: true
       containers:
-        - name: decode
-          image: nvcr.io/nvidia/dynamo:latest
-          command: ["dynamo-worker"]
+        - name: decode-worker
+          image: dynamo-bf3sh:arm64
+          command: ["/opt/dynamo/bin/dynamo-serve"]
           args:
+            - "--config=/etc/dynamo/dynamo-bf3-config.yaml"
             - "--role=decode"
-            - "--engine=sglang"
-            - "--control-plane=dynamo-control-plane.dynamo-inference.svc:9100"
           resources:
             requests:
+              cpu: "14"
+              memory: "24Gi"
               nvidia.com/gpu: "1"
-              cpu: "4"
-              memory: "16Gi"
             limits:
+              cpu: "16"
+              memory: "28Gi"
               nvidia.com/gpu: "1"
-              cpu: "8"
-              memory: "32Gi"
+          securityContext:
+            privileged: true
           env:
-            - name: NIXL_METADATA_BACKEND
-              value: "kubernetes"
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
             - name: UCX_NET_DEVICES
               value: "mlx5_0:1"
             - name: UCX_TLS
-              value: "rc_mlx5,cuda_copy,cuda_ipc"
+              value: "rc_mlx5,cuda_copy"
+            - name: LD_LIBRARY_PATH
+              value: "/opt/nixl/lib:/opt/ucx/lib:/usr/local/cuda/lib64"

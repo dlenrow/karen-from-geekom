@@ -1,11 +1,13 @@
 #!/bin/bash
-# Build NIXL for ARM64 (aarch64) on Grace CPU / BF-3
-# Targets: Native build on Grace CPU or cross-compile from x86_64
+# Build NIXL for ARM64 (aarch64) on BF-3 SH (self-hosted mode)
+# BF-3 ARM cores are the root complex host for GPU in adjacent PCIe slot
 #
 # Prerequisites:
-#   - Ubuntu 22.04/24.04 (aarch64)
-#   - CUDA toolkit 12.x+ (aarch64)
-#   - UCX 1.20.x built with mlx5 support
+#   - BF-3 SH (B3220SH) with Ubuntu 22.04/24.04 (aarch64)
+#   - CUDA toolkit 12.x+ (aarch64 / sbsa)
+#   - GPU visible from BF-3 ARM cores (nvidia-smi works)
+#   - UCX 1.20.x built with mlx5 + CUDA support
+#   - DOCA SDK (for GDAKI backend, optional)
 #   - Python 3.10+
 #   - meson, ninja, cmake
 
@@ -18,7 +20,9 @@ UCX_DIR="${UCX_DIR:-/opt/ucx}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 BUILD_TYPE="${BUILD_TYPE:-release}"
 ENABLE_GDS="${ENABLE_GDS:-false}"
+ENABLE_GDAKI="${ENABLE_GDAKI:-true}"
 ENABLE_ETCD="${ENABLE_ETCD:-true}"
+DOCA_DIR="${DOCA_DIR:-/opt/mellanox/doca}"
 
 ARCH=$(uname -m)
 if [ "$ARCH" != "aarch64" ]; then
@@ -111,6 +115,10 @@ build_nixl() {
     cd "$NIXL_SRC"
 
     local PLUGINS="ucx,posix"
+    if [ "$ENABLE_GDAKI" = "true" ] && [ -d "$DOCA_DIR" ]; then
+        PLUGINS="${PLUGINS},gdaki"
+        echo "  GDAKI backend enabled (DOCA SDK found at $DOCA_DIR)"
+    fi
     if [ "$ENABLE_GDS" = "true" ]; then
         PLUGINS="${PLUGINS},gds"
     fi

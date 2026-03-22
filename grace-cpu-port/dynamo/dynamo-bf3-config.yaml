@@ -1,91 +1,125 @@
-# Dynamo control plane configuration for BF-3 Grace CPU deployment
-# This runs the control plane (router, planner, KVBM) on the BF-3's Grace CPU
-# while inference workers run on GPU nodes
+# Dynamo configuration for BF-3 SH (self-hosted) — FULL STACK
+# BF-3 ARM cores run EVERYTHING: control plane + inference workers + CUDA
+# GPU is on BF-3's PCIe root complex, no x86 host
+#
+# CPU Budget (16 ARM A78 cores):
+#   Cores 0-1:   Dynamo control plane (router, frontend, KVBM)
+#   Cores 2-3:   Connection manager (ZMQ, TCP) + NIXL agent
+#   Cores 4-13:  Inference worker (SGLang/vLLM CPU threads)
+#   Cores 14-15: OS, IRQs, RDMA completions
 
 dynamo:
-  # Cluster identity
-  cluster_name: "bf3-disagg-inference"
+  cluster_name: "bf3sh-inference"
 
   # --- Frontend ---
   frontend:
     host: "0.0.0.0"
     port: 8000
-    # Accept requests on BF-3's network interface
-    # Clients connect to BF-3 IP for inference requests
-    max_concurrent_requests: 1024
+    max_concurrent_requests: 256  # Conservative for 16 cores
     timeout_s: 300
+    # Pin to core 1
+    cpu_affinity: "1"
 
-  # --- Router (runs on BF-3 Grace CPU) ---
+  # --- Router ---
   router:
     type: "kv_aware"
-    # KV-aware routing optimizes cache hit rates
     config:
-      # Prefix-based routing for cache locality
       prefix_aware: true
-      # Load-aware balancing across decode workers
       load_balancing: "least_loaded"
-      # Route prefill to dedicated prefill GPUs
       disaggregated: true
-      # Sticky sessions for multi-turn conversations
       session_affinity: true
       session_ttl_s: 600
+    # Pin to core 0
+    cpu_affinity: "0"
 
-  # --- Planner / Autoscaler (runs on BF-3 Grace CPU) ---
+  # --- Planner / Autoscaler ---
   planner:
-    enabled: true
-    config:
-      # SLA targets
-      target_ttft_ms: 200      # Time to first token
-      target_tpot_ms: 30       # Time per output token
-      target_throughput_rps: 100
-      # Scaling bounds
-      min_prefill_workers: 1
-      max_prefill_workers: 8
-      min_decode_workers: 2
-      max_decode_workers: 16
-      # Scaling interval
-      check_interval_s: 10
-      scale_up_threshold: 0.8
-      scale_down_threshold: 0.3
-      cooldown_s: 60
+    # Disable for single-node — enable for multi-node BF-3 cluster
+    enabled: false
+    # enabled: true
+    # config:
+    #   target_ttft_ms: 200
+    #   target_tpot_ms: 30
+    #   min_prefill_workers: 1
+    #   max_decode_workers: 4
+    #   check_interval_s: 30  # Less frequent — save CPU
 
-  # --- KV Block Manager (runs on BF-3 Grace CPU) ---
+  # --- KV Block Manager ---
   kvbm:
-    # Manage KV cache across the memory hierarchy
     tiers:
+      # Tier 0: GPU HBM — fastest, limited capacity
       - name: "gpu_hbm"
         type: "vram"
-        # Managed by workers, KVBM tracks allocation
-      - name: "grace_dram"
-        type: "host"
-        # Grace CPU LPDDR5X — high bandwidth KV cache spillover
-        capacity_gb: 64
-        path: "/dev/hugepages"
-      - name: "nvme"
-        type: "storage"
-        # Local NVMe on BF-3 for cold KV cache
-        capacity_gb: 512
-        path: "/mnt/bf3-nvme"
+        # Managed via CUDA on ARM cores
 
-    # NIXL handles actual data movement between tiers
+      # Tier 1: BF-3 DDR5 — KV cache spillover
+      # ~80 GB/s bandwidth, much less than GPU HBM but usable
+      - name: "bf3_ddr5"
+        type: "host"
+        capacity_gb: 24  # Leave 8GB for OS + processes
+        hugepage_path: "/dev/hugepages"
+
+      # Tier 2: NVMe (optional, if attached to BF-3 PCIe)
+      # - name: "nvme"
+      #   type: "storage"
+      #   capacity_gb: 512
+      #   path: "/mnt/bf3-nvme"
+
     nixl:
       config_path: "/etc/nixl/nixl-bf3-config.yaml"
 
+    # Pin to core 0 (shares with router — both event-driven)
+    cpu_affinity: "0"
+
+  # --- Inference Workers (run on BF-3 ARM cores, use GPU via CUDA) ---
+  workers:
+    prefill:
+      engine: "sglang"  # Lower CPU overhead than vLLM
+      # engine: "vllm"
+      gpu_devices: [0]  # Single GPU on PCIe root complex
+      # Pin worker CPU threads to cores 4-13
+      cpu_affinity: "4-13"
+      config:
+        # Conservative settings for 16 ARM cores
+        max_batch_size: 32
+        # Offload tokenizer to GPU if supported
+        # Limit CPU-side preprocessing
+        num_cpu_threads: 8
+
+    decode:
+      engine: "sglang"
+      gpu_devices: [0]
+      cpu_affinity: "4-13"
+      config:
+        max_batch_size: 64
+        num_cpu_threads: 8
+
+    # Single-node mode: prefill + decode on same GPU
+    # Multi-node: disaggregate across BF-3 SH nodes
+    mode: "colocated"  # or "disaggregated" for multi-node
+
   # --- Discovery Plane ---
   discovery:
-    # For K8s deployment
-    backend: "kubernetes"
-    # For standalone / bare-metal
+    # Single node: file-based (no external deps)
+    backend: "file"
+    file:
+      path: "/var/run/dynamo/discovery.json"
+
+    # Multi-node: etcd running on one BF-3 node
     # backend: "kv_store"
     # etcd:
-    #   endpoints: ["http://localhost:2379"]
+    #   endpoints: ["http://bf3-node-1:2379"]
+
+    # K8s cluster of BF-3 nodes:
+    # backend: "kubernetes"
 
   # --- Request Plane ---
   request_plane:
     transport: "tcp"
-    # BF-3 has direct network access — low latency to workers
     bind_address: "0.0.0.0"
     port: 8001
+    # Pin to core 2
+    cpu_affinity: "2"
 
   # --- Event Plane ---
   event_plane:
@@ -93,13 +127,22 @@ dynamo:
     bind_address: "0.0.0.0"
     port: 8002
     serialization: "msgpack"
+    # Pin to core 3
+    cpu_affinity: "3"
 
-  # --- Worker configuration (reference — these run on GPU nodes, not BF-3) ---
-  workers:
-    prefill:
-      engine: "sglang"  # or "vllm", "trtllm"
-      # Workers connect back to BF-3 control plane
-      control_plane_address: "${BF3_IP}:8001"
-    decode:
-      engine: "sglang"
-      control_plane_address: "${BF3_IP}:8001"
+  # --- CUDA / GPU Configuration ---
+  gpu:
+    # GPU is on BF-3 PCIe root complex
+    cuda_visible_devices: "0"
+    # Verify GPU is accessible from ARM cores
+    verify_on_startup: true
+    # PCIe Gen5 x16 to GPU
+    expected_pcie_width: 16
+    expected_pcie_gen: 5
+
+  # --- Resource Limits ---
+  resources:
+    # Total system memory budget (BF-3 DDR5)
+    max_host_memory_gb: 28  # Leave 4GB for OS
+    # GPU memory managed by inference engine
+    max_gpu_memory_fraction: 0.90

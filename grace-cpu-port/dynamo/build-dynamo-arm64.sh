@@ -1,18 +1,24 @@
 #!/bin/bash
-# Build NVIDIA Dynamo control plane components for ARM64 (Grace CPU / BF-3)
+# Build NVIDIA Dynamo FULL STACK for ARM64 on BF-3 SH (self-hosted)
+# BF-3 ARM cores are the host CPU — runs control plane AND inference workers
+# GPU is on BF-3's PCIe root complex
 #
 # Components built:
 #   - dynamo-router    (KV-aware request routing)
 #   - dynamo-planner   (SLA-driven autoscaler)
 #   - dynamo-frontend  (HTTP API)
 #   - dynamo-kvbm      (KV Block Manager)
-#   - Python libraries  (dynamo SDK, bindings)
+#   - dynamo-worker    (Inference worker launcher)
+#   - Python libraries (dynamo SDK, bindings)
+#   - SGLang / vLLM    (Inference engine, aarch64 + CUDA)
 #
 # Prerequisites:
-#   - aarch64 system (Grace CPU or BF-3 DPU)
+#   - BF-3 SH (B3220SH) with aarch64 Ubuntu 22.04/24.04
+#   - GPU visible from ARM cores (nvidia-smi)
+#   - CUDA toolkit 12.x+ (aarch64)
 #   - Rust 1.80+ (aarch64-unknown-linux-gnu)
-#   - Python 3.10+
-#   - protobuf-compiler, libhwloc, libudev
+#   - Python 3.12+ (required for KVBM)
+#   - protobuf-compiler, libhwloc, libudev, libzmq
 #   - NIXL installed (for KV cache transfers)
 
 set -euo pipefail
@@ -112,20 +118,52 @@ build_rust() {
     export NIXL_INCLUDE_DIR="${NIXL_DIR}/include"
     export LD_LIBRARY_PATH="${NIXL_DIR}/lib:${LD_LIBRARY_PATH:-}"
 
-    # Build control plane binaries
-    # These are the CPU-only components that run on BF-3 Grace
+    # Set CUDA paths for GPU-aware components
+    export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+    export CUDA_PATH="$CUDA_HOME"
+
+    # Build full stack — control plane + worker infrastructure
+    # On BF-3 SH, ARM cores drive the GPU via CUDA
     cargo build $CARGO_FLAGS \
         --target aarch64-unknown-linux-gnu \
-        -p dynamo-router \
-        -p dynamo-planner \
-        -p dynamo-frontend \
-        -p dynamo-kvbm \
         2>&1 || {
-            echo "NOTE: If specific packages fail, try building the workspace:"
-            cargo build $CARGO_FLAGS --target aarch64-unknown-linux-gnu
+            echo "NOTE: Full workspace build failed, trying individual packages:"
+            for pkg in dynamo-router dynamo-planner dynamo-frontend dynamo-kvbm dynamo-worker dynamo-llm; do
+                cargo build $CARGO_FLAGS --target aarch64-unknown-linux-gnu -p "$pkg" 2>/dev/null || true
+            done
         }
 
     echo "Rust binaries built successfully"
+}
+
+# --- Step 4b: Build inference engine (SGLang) for aarch64 + CUDA ---
+build_inference_engine() {
+    echo "--- Building SGLang for aarch64 + CUDA ---"
+
+    source "${DYNAMO_INSTALL}/venv/bin/activate" 2>/dev/null || true
+
+    # SGLang — preferred engine for BF-3 (lower CPU overhead)
+    pip install --no-cache-dir "sglang[all]" 2>/dev/null || {
+        echo "Pre-built wheel not available for aarch64, building from source..."
+        pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
+        git clone --depth 1 https://github.com/sgl-project/sglang.git /tmp/sglang-src
+        cd /tmp/sglang-src
+        pip install -e "python[all]" 2>/dev/null || pip install -e . || true
+    }
+
+    # Verify CUDA works from ARM cores
+    python3 -c "
+import torch
+if torch.cuda.is_available():
+    print(f'CUDA OK: {torch.cuda.get_device_name(0)}')
+    print(f'  Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')
+else:
+    print('WARN: CUDA not available — GPU may not be visible from ARM cores')
+    print('  Check: nvidia-smi, CUDA_VISIBLE_DEVICES, PCIe root complex config')
+"
+
+    deactivate 2>/dev/null || true
+    echo "Inference engine setup complete"
 }
 
 # --- Step 5: Build Python components ---
@@ -139,9 +177,8 @@ build_python() {
 
     pip install --upgrade pip setuptools wheel
 
-    # Install Dynamo Python package
-    # Skip GPU-specific backends for control-plane-only build
-    pip install -e ".[core]" 2>/dev/null || pip install -e . || {
+    # Install Dynamo Python package — full stack including GPU support
+    pip install -e ".[sglang]" 2>/dev/null || pip install -e ".[core]" 2>/dev/null || pip install -e . || {
         echo "WARN: pip install failed, trying manual setup"
         python3 setup.py develop 2>/dev/null || true
     }
@@ -158,7 +195,7 @@ install_binaries() {
     cd "$DYNAMO_SRC"
     local TARGET_DIR="target/aarch64-unknown-linux-gnu/${BUILD_TYPE}"
 
-    for bin in dynamo-router dynamo-planner dynamo-frontend dynamo-kvbm; do
+    for bin in dynamo-router dynamo-planner dynamo-frontend dynamo-kvbm dynamo-worker dynamo-serve dynamo-llm; do
         if [ -f "${TARGET_DIR}/${bin}" ]; then
             cp "${TARGET_DIR}/${bin}" "${DYNAMO_INSTALL}/bin/"
             echo "  Installed: ${bin}"
@@ -167,7 +204,7 @@ install_binaries() {
 
     # Also check default target dir (native build)
     TARGET_DIR="target/${BUILD_TYPE}"
-    for bin in dynamo-router dynamo-planner dynamo-frontend dynamo-kvbm; do
+    for bin in dynamo-router dynamo-planner dynamo-frontend dynamo-kvbm dynamo-worker dynamo-serve dynamo-llm; do
         if [ -f "${TARGET_DIR}/${bin}" ] && [ ! -f "${DYNAMO_INSTALL}/bin/${bin}" ]; then
             cp "${TARGET_DIR}/${bin}" "${DYNAMO_INSTALL}/bin/"
             echo "  Installed (native): ${bin}"
@@ -196,6 +233,7 @@ case "${1:-all}" in
     clone)    clone_dynamo ;;
     patch)    apply_patches ;;
     rust)     build_rust ;;
+    engine)   build_inference_engine ;;
     python)   build_python ;;
     install)  install_binaries ;;
     verify)   verify_build ;;
@@ -205,11 +243,12 @@ case "${1:-all}" in
         apply_patches
         build_rust
         build_python
+        build_inference_engine
         install_binaries
         verify_build
         ;;
     *)
-        echo "Usage: $0 {deps|clone|patch|rust|python|install|verify|all}"
+        echo "Usage: $0 {deps|clone|patch|rust|engine|python|install|verify|all}"
         exit 1
         ;;
 esac

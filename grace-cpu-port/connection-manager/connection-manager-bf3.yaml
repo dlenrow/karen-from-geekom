@@ -1,4 +1,4 @@
-# Connection Manager configuration for BF-3 Grace CPU
+# Connection Manager configuration for BF-3 SH (self-hosted, root complex mode)
 # Manages Discovery, Request, and Event planes for disaggregated inference
 #
 # In Dynamo v0.9.0+, the "connection manager" is the combination of:
@@ -6,8 +6,9 @@
 #   2. Request Plane  — inter-service RPC (TCP transport)
 #   3. Event Plane    — pub/sub events (ZMQ + MessagePack)
 #
-# On BF-3, the connection manager runs on Grace CPU and serves as the
-# central coordination point for all inference workers on GPU nodes.
+# On BF-3 SH, the connection manager runs on the same ARM cores as inference.
+# For single-node: intra-process communication, minimal overhead.
+# For multi-node: coordinates disaggregated prefill/decode across BF-3 SH nodes.
 
 # --- Discovery Plane ---
 # How workers find each other and the control plane
@@ -17,10 +18,9 @@ discovery:
   backend: "kubernetes"
 
   kubernetes:
-    # BF-3 nodes labeled for control plane scheduling
+    # Each BF-3 SH node is a full inference node (control + workers + GPU)
     namespace: "dynamo-inference"
-    label_selector: "dynamo.nvidia.com/role=control-plane"
-    # Watch EndpointSlices for worker registration
+    label_selector: "dynamo.nvidia.com/node-type=bf3-sh"
     watch_timeout_s: 30
 
   # Standalone / bare-metal fallback
