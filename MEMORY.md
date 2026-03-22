@@ -4,6 +4,36 @@ Reverse-chronological log of architectural decisions and pivots.
 
 ---
 
+## 2026-03-22: Market thesis — $2.5T installed base, $5T next gen
+
+**Installed base ($2.5T NVIDIA inference gear already deployed):**
+- All of it has permissive, no-auth x86 RDMA control planes
+- Needs an OVERLAY control plane solution — can't rip and replace
+- BF-3 DPU already in the NIC tray (HGX H200, 1:1 GPU-to-NIC)
+- Our BFB appliance is a drop-in overlay: flash BF-3, boot, done
+- Zero changes to x86 host, zero changes to inference software
+- Immediate value: default-deny, SPIFFE identity, RDMA audit
+
+**Next gen ($5T Vera/Rubin generation):**
+- Vera CC burns 10% CPU + latency on full-fabric encryption
+- That's the only option if your access control is host-based
+- Nobody will want to pay that tax if they can get the same security
+  with Cilium RDMA on BF-4 at zero dataplane overhead
+- BF-4 will have more ARM cores, more bandwidth, likely native
+  RDMA-aware eBPF hooks (building on BF-3 representor model)
+- foil-cilium CNP isolation on BF-4 = same security, no crypto tax
+- Customers choose: 10% CPU + latency (Vera) vs 0% (Cilium on BF-4)
+
+**Strategic position:**
+- Build on BF-2 (home lab) → deploy on BF-3 (HGX installed base)
+  → productize on BF-4 (next gen, native RDMA CNP support)
+- foil-cilium proves the model on BF-2/3, becomes the reference
+  implementation for BF-4 native RDMA security
+- NVIDIA has incentive to adopt: makes their $5T hardware more
+  competitive vs Vera's software-only approach that taxes GPU customers
+
+---
+
 ## 2026-03-22: Competitive positioning vs Vera CC (10% CPU + latency)
 
 **Context:** Vera's confidential computing solution spends ~10% of CPU on
