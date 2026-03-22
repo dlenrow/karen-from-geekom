@@ -4,6 +4,28 @@ Reverse-chronological log of architectural decisions and pivots.
 
 ---
 
+## 2026-03-22: Competitive positioning vs Vera CC (10% CPU + latency)
+
+**Context:** Vera's confidential computing solution spends ~10% of CPU on
+crypto and adds significant latency. Their threat model requires encrypting
+everything because access control is weak — the control plane runs on the
+same untrusted x86 host as the workload, so they can't enforce who talks
+to whom at the fabric level. Encryption is their only option.
+
+**Our advantage:** BF-3 DPU as a drop-in device IS the access control.
+foil-cilium CNPs enforce ibverbs-level isolation on the NIC card itself.
+The hardware trust boundary means:
+- No dataplane encryption needed → 0% CPU overhead (vs Vera's 10%)
+- No added latency on RDMA path (vs Vera's crypto latency)
+- mTLS only on API edge (user ↔ TEE) — negligible vs full-fabric encryption
+- Same or better security posture: access control > encryption-without-access-control
+
+**Key insight:** Encryption compensates for weak access control. Strong access
+control (enforced at hardware trust boundary) makes dataplane encryption
+redundant. Vera encrypts because they must. We isolate because we can.
+
+---
+
 ## 2026-03-22: No dataplane encryption — CNPs isolate, fabric is optical
 
 **Question:** Do we need encrypted RDMA dataplane?
