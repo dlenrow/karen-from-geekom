@@ -78,12 +78,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# === OPA (Open Policy Agent) for ARM64 ===
-RUN curl -fsSL -o /usr/local/bin/opa \
-    https://openpolicyagent.org/downloads/latest/opa_linux_arm64_static && \
-    chmod +x /usr/local/bin/opa
-
-# === SPIRE Agent for ARM64 ===
+# === SPIRE Agent for ARM64 (used by foil-cilium for SPIFFE identity) ===
 ARG SPIRE_VERSION=1.11.0
 RUN curl -fsSL -o /tmp/spire.tar.gz \
     https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}/spire-${SPIRE_VERSION}-linux-arm64-musl.tar.gz && \
@@ -156,7 +151,6 @@ COPY --from=builder /opt/ucx /opt/ucx
 COPY --from=builder /opt/nixl /opt/nixl
 COPY --from=builder /opt/dynamo /opt/dynamo
 COPY --from=builder /opt/spire /opt/spire
-COPY --from=builder /usr/local/bin/opa /usr/local/bin/opa
 
 # Python packages
 COPY --from=builder /usr/local/lib/python3.12 /usr/local/lib/python3.12
@@ -237,35 +231,42 @@ echo "[BFB] Enabling GPUDirect RDMA"
 modprobe nvidia-peermem 2>/dev/null || true
 echo "nvidia-peermem" >> /etc/modules-load.d/gpudirect.conf
 
-# --- Deploy OPA policies ---
-echo "[BFB] Deploying default-deny OPA policies"
-mkdir -p /etc/opa/policies
-cp /opt/dynamo-appliance/policies/*.rego /etc/opa/policies/
-cp /opt/dynamo-appliance/policies/*.yaml /etc/opa/policies/
+# --- Install K3s ---
+echo "[BFB] Installing K3s (lightweight K8s for BF-3)"
+mkdir -p /etc/rancher/k3s
+cp /opt/dynamo-appliance/k3s/k3s-bf3sh-config.yaml /etc/rancher/k3s/config.yaml
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server" sh -s - \
+    --config /etc/rancher/k3s/config.yaml
 
-# --- Deploy DOCA Flow firewall rules ---
+# --- Install foil-cilium (RDMA-aware CNI) ---
+echo "[BFB] Installing foil-cilium with RDMA/ibverbs support"
+# foil-cilium must be pre-built and included in BFB, or pulled from registry
+helm install cilium /opt/dynamo-appliance/cilium/foil-cilium \
+    -f /opt/dynamo-appliance/cilium/values-bf3sh.yaml \
+    --namespace kube-system \
+    --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+
+# --- Deploy CNP default-deny policies ---
+echo "[BFB] Deploying default-deny CNPs for RDMA"
+kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create namespace dynamo-inference 2>/dev/null || true
+kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply \
+    -f /opt/dynamo-appliance/cilium/cnp-rdma-default-deny.yaml 2>/dev/null || true
+kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply \
+    -f /opt/dynamo-appliance/cilium/cnp-ibverbs-audit.yaml 2>/dev/null || true
+
+# --- Deploy DOCA Flow DMA firewall rules (PCIe level, below K8s) ---
 echo "[BFB] Deploying DMA firewall rules"
 mkdir -p /etc/doca/flow
 cp /opt/dynamo-appliance/dma-firewall/*.yaml /etc/doca/flow/
 
-# --- Deploy IPsec configuration ---
-echo "[BFB] Deploying IPsec configuration"
-mkdir -p /etc/ipsec
-cp /opt/dynamo-appliance/ipsec/*.yaml /etc/ipsec/
-
-# --- Deploy SPIRE agent config ---
+# --- Deploy SPIRE agent config (used by foil-cilium for SPIFFE) ---
 echo "[BFB] Deploying SPIRE agent configuration"
 mkdir -p /etc/spire
 cp /opt/dynamo-appliance/identity/*.yaml /etc/spire/
 
-# --- Deploy audit configuration ---
-echo "[BFB] Deploying audit configuration"
-mkdir -p /etc/dynamo/audit
-cp /opt/dynamo-appliance/audit/*.yaml /etc/dynamo/audit/
-
 # --- Enable services ---
+systemctl enable k3s.service
 systemctl enable dynamo-appliance.service
-systemctl enable opa-policy-agent.service
 systemctl enable spire-agent.service
 
 echo "[BFB] First boot complete. Reboot to start services."
@@ -276,9 +277,9 @@ FIRSTBOOT
     cat > "${BUILD_DIR}/configs/dynamo-appliance.service" << 'SERVICE'
 [Unit]
 Description=Dynamo Zero-Trust Inference Appliance
-After=network-online.target nvidia-persistenced.service
+After=network-online.target nvidia-persistenced.service k3s.service
 Wants=network-online.target
-Requires=opa-policy-agent.service
+Requires=k3s.service
 
 [Service]
 Type=exec
@@ -304,27 +305,6 @@ ProtectKernelModules=false
 WantedBy=multi-user.target
 SERVICE
 
-    # OPA service
-    cat > "${BUILD_DIR}/configs/opa-policy-agent.service" << 'OPA_SERVICE'
-[Unit]
-Description=OPA Policy Agent (Default-Deny Inference Policy)
-After=network-online.target
-
-[Service]
-Type=exec
-ExecStart=/usr/local/bin/opa run \
-    --server \
-    --addr=localhost:8181 \
-    --log-level=info \
-    /etc/opa/policies/
-CPUAffinity=2 3
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-OPA_SERVICE
-
     echo "Boot configuration created"
 }
 
@@ -339,14 +319,18 @@ package_bfb() {
 
     # Overlay security configs
     local OVERLAY_DIR="${BUILD_DIR}/overlay"
-    mkdir -p "${OVERLAY_DIR}/opt/dynamo-appliance"/{scripts,policies,dma-firewall,ipsec,identity,audit,gpu-attestation}
+    mkdir -p "${OVERLAY_DIR}/opt/dynamo-appliance"/{scripts,cilium,dma-firewall,identity,gpu-attestation,k3s}
 
-    # Copy security layer configs
-    cp "${PROJECT_DIR}/security/policies/"* "${OVERLAY_DIR}/opt/dynamo-appliance/policies/"
+    # Copy foil-cilium configs (CNPs, values, Hubble)
+    cp "${PROJECT_DIR}/k3s/cilium/"* "${OVERLAY_DIR}/opt/dynamo-appliance/cilium/"
+    cp "${PROJECT_DIR}/k3s/hubble/"* "${OVERLAY_DIR}/opt/dynamo-appliance/cilium/" 2>/dev/null || true
+    cp "${PROJECT_DIR}/k3s/k3s-bf3sh-config.yaml" "${OVERLAY_DIR}/opt/dynamo-appliance/k3s/"
+
+    # Copy DOCA DMA firewall (PCIe level — below K8s/Cilium)
     cp "${PROJECT_DIR}/security/dma-firewall/"* "${OVERLAY_DIR}/opt/dynamo-appliance/dma-firewall/"
-    cp "${PROJECT_DIR}/security/ipsec/"* "${OVERLAY_DIR}/opt/dynamo-appliance/ipsec/"
+    # Copy SPIRE identity config (used by foil-cilium)
     cp "${PROJECT_DIR}/security/identity/"* "${OVERLAY_DIR}/opt/dynamo-appliance/identity/"
-    cp "${PROJECT_DIR}/security/audit/"* "${OVERLAY_DIR}/opt/dynamo-appliance/audit/"
+    # Copy GPU attestation
     cp "${PROJECT_DIR}/security/gpu-attestation/"* "${OVERLAY_DIR}/opt/dynamo-appliance/gpu-attestation/"
 
     # Copy scripts
@@ -360,7 +344,6 @@ package_bfb() {
     cp "${PROJECT_DIR}/nixl/nixl-bf3-config.yaml" "${OVERLAY_DIR}/etc/nixl/" 2>/dev/null || \
         (mkdir -p "${OVERLAY_DIR}/etc/nixl" && cp "${PROJECT_DIR}/nixl/nixl-bf3-config.yaml" "${OVERLAY_DIR}/etc/nixl/")
     cp "${BUILD_DIR}/configs/dynamo-appliance.service" "${OVERLAY_DIR}/etc/systemd/system/"
-    cp "${BUILD_DIR}/configs/opa-policy-agent.service" "${OVERLAY_DIR}/etc/systemd/system/"
 
     # Create overlay tar
     (cd "$OVERLAY_DIR" && tar -cf "${BUILD_DIR}/overlay.tar" .)

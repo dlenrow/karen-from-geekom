@@ -1,0 +1,102 @@
+# Hubble configuration for RDMA flow observability on BF-3 SH
+# Uses foil-cilium's RDMA-aware Hubble extensions.
+#
+# Hubble on BF-3 SH provides:
+#   - RoCE v2 flow records (src/dst node, QP numbers, bytes)
+#   - ibverbs operation breakdown (WRITE/READ/SEND/ATOMIC counts)
+#   - RDMA policy decision audit trail
+#   - DMA firewall drop visibility
+#   - Cross-node KV cache transfer tracing
+
+hubble:
+  # --- Flow Export ---
+  export:
+    static:
+      enabled: true
+      filePath: "/var/log/hubble/flows.json"
+      # Max 1GB per flow log file
+      maxSizeMb: 1024
+      maxBackups: 5
+
+    # RDMA-specific export (foil-cilium extension)
+    rdma:
+      enabled: true
+      filePath: "/var/log/hubble/rdma-flows.json"
+      # Fields to capture in RDMA flow records
+      fields:
+        - "timestamp"
+        - "source_identity"
+        - "destination_identity"
+        - "source_spiffe_id"
+        - "destination_spiffe_id"
+        - "rdma_verb"          # WRITE, READ, SEND, RECV, ATOMIC
+        - "rdma_qp_num"        # Queue Pair number
+        - "rdma_bytes"         # Transfer size
+        - "rdma_rkey"          # Remote key (memory region)
+        - "policy_verdict"     # ALLOW, DENY, AUDIT
+        - "policy_name"        # Which CNP matched
+        - "encryption_status"  # IPsec SA active or not
+
+  # --- Metrics ---
+  metrics:
+    enabled: true
+    address: ":9965"
+
+    # Standard metrics
+    enableOpenMetrics: true
+
+    # foil-cilium RDMA metrics
+    rdmaMetrics:
+      enabled: true
+      metrics:
+        # RDMA operations per verb type
+        - "rdma_ops_total"
+          labels: ["verb", "source_identity", "destination_identity"]
+        # RDMA bytes transferred
+        - "rdma_bytes_total"
+          labels: ["verb", "direction", "source_identity"]
+        # RDMA policy drops
+        - "rdma_policy_drops_total"
+          labels: ["verb", "policy_name", "source_identity"]
+        # RDMA connection count
+        - "rdma_connections_active"
+          labels: ["source_identity", "destination_identity"]
+        # KV cache transfer latency
+        - "rdma_kvcache_transfer_duration_seconds"
+          labels: ["source_node", "destination_node"]
+
+  # --- Dashboards ---
+  # Grafana dashboards for RDMA monitoring
+  dashboards:
+    rdmaOverview:
+      title: "RDMA Inference Fabric"
+      panels:
+        - "RDMA ops/sec by verb type"
+        - "RDMA bytes/sec by source → destination"
+        - "Policy drops by CNP rule"
+        - "KV cache transfer latency P50/P95/P99"
+        - "Active RDMA connections per node"
+        - "ibverbs anomalies (unexpected ATOMIC ops)"
+
+  # --- Alerts ---
+  alerts:
+    # Alert on unexpected RDMA operations
+    - name: "rdma-atomic-detected"
+      description: "ATOMIC RDMA operation detected — not expected in inference"
+      condition: "rdma_ops_total{verb=~'ATOMIC.*'} > 0"
+      severity: "critical"
+
+    - name: "rdma-unauthenticated-flow"
+      description: "RDMA flow without SPIFFE identity"
+      condition: "rdma_ops_total{source_spiffe_id=''} > 0"
+      severity: "critical"
+
+    - name: "rdma-policy-drop-spike"
+      description: "High rate of RDMA policy drops (possible attack)"
+      condition: "rate(rdma_policy_drops_total[5m]) > 100"
+      severity: "warning"
+
+    - name: "rdma-unencrypted-flow"
+      description: "Unencrypted RDMA flow detected"
+      condition: "rdma_ops_total{encryption_status='none'} > 0"
+      severity: "critical"

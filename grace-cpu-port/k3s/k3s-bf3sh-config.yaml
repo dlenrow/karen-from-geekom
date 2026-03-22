@@ -1,0 +1,83 @@
+# K3s server configuration for BF-3 SH zero-trust inference node
+#
+# K3s is lightweight enough for BF-3's 16 ARM cores.
+# foil-cilium replaces Flannel as CNI with RDMA-aware networking.
+#
+# Install: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server" sh -s - --config /etc/rancher/k3s/config.yaml
+# Or: k3s server --config /etc/rancher/k3s/config.yaml
+
+# --- Disable defaults that Cilium replaces ---
+flannel-backend: "none"
+disable-network-policy: true
+disable:
+  - traefik          # No ingress controller needed (BF-3 has no external HTTP)
+  - servicelb        # No load balancer needed
+  - local-storage    # Use host paths or NVMe directly
+
+# --- Cluster config ---
+cluster-init: true    # First node initializes cluster
+# For multi-node BF-3 cluster:
+# token: "${K3S_TOKEN}"
+# server: "https://bf3-node-1:6443"  # Join existing cluster
+
+# --- Networking ---
+# Use host network for RDMA performance
+# foil-cilium manages pod networking
+cluster-cidr: "10.42.0.0/16"
+service-cidr: "10.43.0.0/16"
+
+# --- Container runtime ---
+# containerd (K3s default) — lightweight
+container-runtime-endpoint: "/run/k3s/containerd/containerd.sock"
+
+# --- etcd (embedded) ---
+# K3s embedded etcd for HA — no external deps
+# Single-node: SQLite (default) is fine
+# Multi-node: use embedded etcd
+# datastore-endpoint: ""  # Empty = embedded SQLite
+# For HA:
+# cluster-init: true  (on first node)
+# server: https://bf3-node-1:6443  (on joining nodes)
+
+# --- kubelet ---
+kubelet-arg:
+  # Reserve resources for system + Cilium
+  - "system-reserved=cpu=2000m,memory=2Gi"
+  - "kube-reserved=cpu=500m,memory=512Mi"
+  # Enforce CPU/memory limits
+  - "enforce-node-allocatable=pods"
+  # Allow privileged containers (GPUDirect, RDMA)
+  - "allow-privileged=true"
+  # CPU manager for pinning inference workers
+  - "cpu-manager-policy=static"
+  - "cpu-manager-reconcile-period=5s"
+  # Topology manager for NUMA-aware scheduling
+  - "topology-manager-policy=best-effort"
+  # Huge pages
+  - "feature-gates=HugePageStorageMediumSize=true"
+
+# --- API server ---
+kube-apiserver-arg:
+  # Audit logging
+  - "audit-log-path=/var/log/k3s/audit.log"
+  - "audit-log-maxage=30"
+  - "audit-log-maxbackup=10"
+  - "audit-log-maxsize=100"
+  # RBAC only (no ABAC)
+  - "authorization-mode=Node,RBAC"
+
+# --- Labels for this node ---
+node-label:
+  - "nvidia.com/dpu=bf3-sh"
+  - "kubernetes.io/arch=arm64"
+  - "dynamo.nvidia.com/node-type=bf3-sh"
+  - "dynamo.nvidia.com/gpu=true"
+
+# --- Taints (only inference workloads on BF-3 SH nodes) ---
+node-taint:
+  - "nvidia.com/dpu=bf3-sh:NoSchedule"
+
+# --- GPU device plugin ---
+# NVIDIA device plugin for K3s discovers GPU on PCIe root complex
+# Deploy after K3s + Cilium are running:
+# kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/main/deployments/static/nvidia-device-plugin.yml

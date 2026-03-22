@@ -1,0 +1,154 @@
+# foil-cilium Helm values for BF-3 SH Zero-Trust Inference
+# Uses foil-cilium (not upstream) for RDMA/ibverbs-aware CNPs and Hubble.
+#
+# foil-cilium adds:
+#   - RoCE v2 (UDP 4791) flow visibility in Hubble
+#   - ibverbs operation policing in CNPs
+#   - RDMA message inspection on BF-3 representor ports
+#
+# K3s bootstrap: k3s server --flannel-backend=none --disable-network-policy
+# Then: helm install cilium ./foil-cilium/install/kubernetes/cilium -f values-bf3sh.yaml
+
+# --- Image: foil-cilium (custom build, not upstream) ---
+image:
+  repository: "foil-cilium/cilium"
+  tag: "latest"
+  # Build for aarch64 (BF-3 ARM cores)
+  # docker buildx build --platform linux/arm64 -t foil-cilium/cilium:latest .
+
+operator:
+  image:
+    repository: "foil-cilium/cilium-operator"
+    tag: "latest"
+
+# --- K3s integration ---
+k8sServiceHost: "127.0.0.1"
+k8sServicePort: "6443"
+
+# Disable kube-proxy replacement (K3s manages this)
+# Or enable for full eBPF datapath:
+kubeProxyReplacement: true
+
+# --- CNI ---
+cni:
+  # Exclusive mode — foil-cilium is the only CNI
+  exclusive: true
+  # Install to K3s CNI dir
+  install: true
+  binPath: "/opt/cni/bin"
+  confPath: "/etc/cni/net.d"
+
+# --- eBPF on BF-3 ARM64 ---
+bpf:
+  # BF-3 has limited cores — use efficient map sizes
+  mapDynamicSizeRatio: 0.0025
+  # Pre-allocate BPF maps
+  preallocateMaps: true
+  # Enable host routing (no overlay needed for BF-3 fabric)
+  hostLegacyRouting: false
+
+# --- RDMA / RoCE v2 awareness (foil-cilium extension) ---
+rdma:
+  # Enable RDMA-aware datapath (foil-cilium feature)
+  enabled: true
+  # Monitor RoCE v2 traffic on UDP 4791
+  rocePort: 4791
+  # ibverbs operation visibility and policing
+  ibverbsPolicing: true
+  # Representor port monitoring on BF-3
+  # BF-3 SH representor ports give visibility into NIC traffic
+  representorPorts: true
+  # ConnectX-7 device
+  device: "mlx5_0"
+
+# --- Encryption ---
+encryption:
+  # IPsec for RoCE v2 traffic encryption
+  enabled: true
+  type: "ipsec"
+  # Or WireGuard (lower overhead but less granular):
+  # type: "wireguard"
+  ipsec:
+    # AES-256-GCM (ConnectX-7 hardware offload)
+    keyFile: "/etc/cilium/ipsec-keys"
+    # Interface for encrypted traffic
+    interface: "mlx5_0"
+
+# --- Identity / mTLS ---
+authentication:
+  mutual:
+    # SPIFFE-based mutual authentication
+    spiffe:
+      enabled: true
+      # SPIRE server (management plane)
+      serverAddress: "${SPIRE_SERVER_ADDR:-spire-server.management.svc:8081}"
+      trustDomain: "inference.cluster.local"
+
+# --- Hubble (observability) ---
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+  metrics:
+    enabled:
+      - "dns"
+      - "drop"
+      - "tcp"
+      - "flow"
+      - "icmp"
+      - "httpV2"
+      # foil-cilium: RDMA flow metrics
+      - "rdma"
+      - "ibverbs"
+    serviceMonitor:
+      enabled: true
+
+  # foil-cilium: RDMA flow export
+  export:
+    rdma:
+      enabled: true
+      # Export RDMA flows to audit log
+      format: "json"
+      filePath: "/var/log/hubble/rdma-flows.json"
+
+# --- Resource constraints (16 ARM A78 cores, ~32GB DDR5) ---
+resources:
+  cilium:
+    requests:
+      cpu: "500m"
+      memory: "256Mi"
+    limits:
+      cpu: "2000m"   # Max 2 cores for Cilium agent
+      memory: "512Mi"
+  operator:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+# --- Node selector (BF-3 SH only) ---
+nodeSelector:
+  kubernetes.io/arch: "arm64"
+  nvidia.com/dpu: "bf3-sh"
+
+# --- Tunnel mode: disabled (direct routing on RDMA fabric) ---
+tunnel: "disabled"
+autoDirectNodeRoutes: true
+
+# --- IPAM ---
+ipam:
+  mode: "kubernetes"
+
+# --- Monitoring ---
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+# --- Debug (disable in production) ---
+debug:
+  enabled: false

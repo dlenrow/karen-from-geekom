@@ -154,20 +154,16 @@ dynamo:
   # ============================================================
 
   security:
-    # Policy engine: OPA with default-deny
+    # Policy enforcement: foil-cilium CNPs (not OPA)
+    # RDMA default-deny and ibverbs policing enforced in eBPF datapath
+    # by foil-cilium CNPs. No userspace policy engine needed.
     policy:
-      engine: "opa"
-      endpoint: "http://localhost:8181/v1/data/dynamo/inference/allow"
-      policy_path: "/etc/opa/policies"
-      # Every inference request evaluated against policy
-      enforce_on:
-        - "inference.submit"
-        - "kvcache.transfer"
-        - "rdma.connect"
-        - "gpu.dma"
-        - "model.load"
-      # Cache policy decisions for performance (short TTL)
-      decision_cache_ttl_ms: 100
+      engine: "cilium-cnp"
+      # CNPs deployed via K8s manifests:
+      #   cnp-rdma-default-deny.yaml  — default DENY all RoCE v2
+      #   cnp-ibverbs-audit.yaml      — audit + rate limit ibverbs
+      # Dynamo respects CNP enforcement at the network level.
+      # Application-level auth handled by SPIFFE mTLS below.
 
     # Identity: SPIFFE/SPIRE
     identity:
@@ -180,11 +176,13 @@ dynamo:
         # SVID used as client/server cert for all connections
         require_peer_svid: true
 
-    # Encrypted RDMA: DOCA IPsec inline
+    # Encrypted RDMA: foil-cilium transparent IPsec (or DOCA inline)
     encrypted_rdma:
       enabled: true
-      config_path: "/etc/ipsec/doca-ipsec-config.yaml"
-      # Reject unencrypted RDMA connections
+      # foil-cilium manages IPsec SAs between nodes
+      # ConnectX-7 hardware offloads AES-256-GCM
+      # Fallback: DOCA IPsec inline via /etc/ipsec/doca-ipsec-config.yaml
+      provider: "cilium"
       reject_cleartext: true
 
     # DMA firewall: DOCA Flow rules
@@ -203,9 +201,11 @@ dynamo:
       # Block inference if attestation fails
       block_on_failure: true
 
-    # Audit logging
+    # Audit: Hubble RDMA flow records (replaces custom audit)
     audit:
       enabled: true
-      config_path: "/etc/dynamo/audit/audit-config.yaml"
-      # Sign audit entries with BF-3 DICE key
-      signed: true
+      # foil-cilium Hubble provides RDMA flow audit automatically
+      # via CNP verdicts + ibverbs metadata in flow records
+      provider: "hubble"
+      # DOCA DMA firewall counters exported separately
+      doca_counters: true

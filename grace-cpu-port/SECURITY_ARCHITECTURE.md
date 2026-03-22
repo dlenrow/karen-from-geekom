@@ -32,24 +32,31 @@ CURRENT STATE (BROKEN):
 Replace the x86 RDMA control plane with a **hardware-enforced zero-trust
 control plane running on BF-3 SH**, delivered as a BFB virtual appliance.
 
+**Security stack:** foil-cilium (custom Cilium fork with RDMA/ibverbs awareness)
+on K3s, providing CNP-based default-deny, Hubble RDMA observability, SPIFFE
+identity, and encrypted transport — all from the control plane on the NIC card.
+
 ```
 TARGET STATE (SECURE):
 
   Client ──── mTLS ────► BF-3 SH (Trust Anchor) ────► GPU TEE
                          │                              │
-                         │ Zero-trust control plane:    │ CC TEE protects
-                         │ • Default-DENY               │ model weights &
-                         │ • SPIFFE identity + DICE     │ compute
-                         │ • Encrypted RDMA (IPsec)     │
-                         │ • Policy engine (OPA)        │ Attestation chain:
-                         │ • DMA firewall               │ BF-3 attests GPU
-                         │ • Hardware root of trust     │ GPU attests to BF-3
-                         │ • Audit logging              │
-                         │ • BF-3 IS the host           │
-                         └──────────────────────────────┘
+                         │  K3s + foil-cilium:          │ CC TEE protects
+                         │  • CNP default-DENY on RDMA  │ model weights &
+                         │  • ibverbs policing           │ compute
+                         │  • Hubble RDMA flow audit     │
+                         │  • SPIFFE identity + DICE     │ Attestation chain:
+                         │  • IPsec encrypted RoCE       │ BF-3 attests GPU
+                         │  • DOCA DMA firewall (PCIe)   │ GPU attests to BF-3
+                         │  • BF-3 IS the host           │
+                         └───────────────────────────────┘
 
   BF-3 SH owns the PCIe root complex. ALL traffic to/from GPU goes through
   the BF-3. The x86 host is ELIMINATED. BF-3 is the hardware trust anchor.
+
+  foil-cilium on BF-3 representor ports sees RoCE v2 (UDP 4791) + ibverbs
+  operations. CNPs enforce who can RDMA what, to which memory regions, with
+  which verb types. Hubble provides full RDMA flow observability.
 ```
 
 ## Threat Model
@@ -74,7 +81,7 @@ TARGET STATE (SECURE):
 | Cleartext prompts on wire   | Exposed via RDMA         | IPsec inline encryption       |
 | Unauthorized GPU access     | Any RDMA peer can DMA    | DMA firewall, default-deny    |
 | No authentication           | Open RDMA connections    | mTLS + SPIFFE + DICE          |
-| No authorization            | No policy enforcement    | OPA policy engine             |
+| No authorization            | No policy enforcement    | foil-cilium CNPs (ibverbs)    |
 | Host compromise → GPU       | Direct PCIe access       | BF-3 owns root complex        |
 | Metadata exposure           | Cleartext routing        | Encrypted control plane       |
 | No audit trail              | No logging               | Hardware-backed audit log      |
@@ -119,47 +126,69 @@ TARGET STATE (SECURE):
 └────────────────────────────────────────────────────────────────┘
 ```
 
-### Layer 3: Policy Engine (Default-Deny)
+### Layer 3: Policy Engine — foil-cilium CNPs (Default-Deny)
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                    Policy Engine                                │
+│        foil-cilium CiliumNetworkPolicies on K3s                │
 │                                                                │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │  OPA (Open Policy Agent) on BF-3 ARM cores              │   │
-│  │                                                         │   │
-│  │  Default: DENY ALL                                      │   │
-│  │                                                         │   │
-│  │  Explicit allows:                                       │   │
-│  │  • inference.submit: requires valid SPIFFE ID +         │   │
-│  │    tenant claim + rate limit                            │   │
-│  │  • kvcache.transfer: requires peer attestation +        │   │
-│  │    same-cluster membership                              │   │
-│  │  • model.load: requires admin SPIFFE ID +               │   │
-│  │    signed model manifest                                │   │
-│  │  • rdma.connect: requires mTLS + policy match           │   │
-│  │  • gpu.dma: requires attestation + policy               │   │
-│  │                                                         │   │
-│  │  Every RDMA operation goes through policy evaluation.   │   │
+│  │  CNP: rdma-default-deny                                 │   │
+│  │  Applies to: ALL pods in dynamo-inference namespace      │   │
+│  │  Default: DENY all RoCE v2 (UDP 4791) ingress/egress    │   │
 │  └─────────────────────────────────────────────────────────┘   │
+│                                                                │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  CNP: allow-rdma-kvcache                                │   │
+│  │  Explicit allow with ibverbs policing:                   │   │
+│  │  • Only WRITE + SEND verbs (block READ, ATOMIC)          │   │
+│  │  • Only between attested bf3sh-node endpoints            │   │
+│  │  • Requires SPIFFE mutual authentication                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  CNP: ibverbs-audit-all                                 │   │
+│  │  Hubble flow records for every RDMA verb type            │   │
+│  │  Alert on unexpected ATOMIC operations                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  CNP: rdma-rate-limit                                   │   │
+│  │  Per-identity rate limits on WRITE/SEND ops/sec          │   │
+│  │  Prevents RDMA-level DoS                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                │
+│  Why CNPs instead of OPA:                                      │
+│  • Enforced in eBPF datapath — no userspace round-trip         │
+│  • Identity-aware (SPIFFE SVIDs via Cilium)                    │
+│  • ibverbs verb-level granularity (foil-cilium extension)      │
+│  • Hubble integration for free audit trail                     │
+│  • K8s-native — declarative, version-controlled, auditable     │   │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-### Layer 4: Encrypted RDMA (Wire-Speed)
+### Layer 4: Encrypted RDMA — foil-cilium + DOCA IPsec
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│              DOCA IPsec Inline Encryption                       │
+│        Encrypted RDMA (foil-cilium IPsec + ConnectX-7 HW)      │
 │                                                                │
-│  ConnectX-7 hardware crypto engine:                            │
-│  • AES-256-GCM at 400Gb/s line rate                            │
-│  • IPsec ESP in transport mode                                 │
-│  • SA (Security Association) per peer node                     │
-│  • Zero CPU overhead (hardware offload)                        │
-│  • Covers ALL RDMA traffic: prompts, KV cache, metadata       │
+│  Two options (both enforced by foil-cilium):                   │
 │                                                                │
+│  Option A: foil-cilium transparent IPsec                       │
+│  • Cilium manages IPsec SAs between nodes                      │
+│  • ConnectX-7 hardware offloads AES-256-GCM                    │
+│  • Applied per-identity (SPIFFE SVID keying)                   │
+│  • RoCE v2 packets encrypted before hitting wire               │
+│                                                                │
+│  Option B: DOCA IPsec inline (standalone)                      │
+│  • Direct DOCA API for SA management                           │
+│  • Full 400Gb/s line rate AES-256-GCM                          │
+│  • IKEv2 with DICE-derived identity keys                       │
+│                                                                │
+│  Either way:                                                   │
 │  Before:  Prompt ──[cleartext RDMA]──► GPU                     │
 │  After:   Prompt ──[AES-256-GCM ESP]──► BF-3 ──[PCIe]──► GPU  │
 │                                                                │
-│  Key management: IKEv2 with DICE-derived identity keys         │
+│  Hubble shows encryption_status per flow — alerts on cleartext │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -192,7 +221,38 @@ TARGET STATE (SECURE):
 └────────────────────────────────────────────────────────────────┘
 ```
 
-### Layer 6: GPU TEE Integration
+### Layer 6: Observability — Hubble RDMA Flow Visibility
+```
+┌────────────────────────────────────────────────────────────────┐
+│              Hubble RDMA Observability (foil-cilium)            │
+│                                                                │
+│  foil-cilium extends Hubble with RDMA flow records:            │
+│                                                                │
+│  Per-flow metadata:                                            │
+│  • Source/destination SPIFFE identity                           │
+│  • RDMA verb type (WRITE, READ, SEND, ATOMIC)                  │
+│  • QP number, R_Key (memory region), transfer size             │
+│  • CNP verdict (ALLOW / DENY / AUDIT)                          │
+│  • Encryption status (IPsec SA active or cleartext)            │
+│  • Policy name that matched                                    │
+│                                                                │
+│  Alerts:                                                       │
+│  • ATOMIC verbs detected (never expected in inference)          │
+│  • Unauthenticated RDMA flow (no SPIFFE ID)                    │
+│  • Cleartext flow (missing encryption)                         │
+│  • Policy drop spike (possible attack)                         │
+│                                                                │
+│  Metrics exported to Prometheus:                                │
+│  • rdma_ops_total{verb, src_identity, dst_identity}            │
+│  • rdma_bytes_total{verb, direction}                           │
+│  • rdma_policy_drops_total{policy_name}                        │
+│  • rdma_kvcache_transfer_duration_seconds                      │
+│                                                                │
+│  This replaces custom audit logging — Hubble IS the audit.     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Layer 7: GPU TEE Integration
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │              GPU Confidential Computing Integration            │
@@ -219,30 +279,39 @@ configured zero-trust inference node.
 
 ```
 BFB Image Contents:
-├── Ubuntu 24.04 aarch64 (minimal)
+├── Ubuntu 24.04 aarch64 (minimal, hardened)
+├── K3s (lightweight K8s for 16 ARM cores)
+├── foil-cilium (RDMA-aware CNI — custom, not upstream)
+│   ├── CNPs: default-deny RDMA + ibverbs policing
+│   ├── Hubble: RDMA flow observability + audit
+│   ├── SPIFFE mutual authentication
+│   └── IPsec transparent encryption
 ├── DOCA SDK + runtime
 ├── CUDA toolkit aarch64
 ├── NVIDIA driver aarch64
 ├── Dynamo (full stack, security-hardened)
-├── NIXL (UCX + GDAKI + IPsec)
-├── SPIRE agent + DICE attestor
-├── OPA policy engine + default-deny policies
-├── IPsec SA manager (DOCA crypto)
-├── DMA firewall rules (DOCA Flow)
+├── NIXL (UCX + GDAKI)
+├── SPIRE agent + BF-3 DICE attestor
+├── DOCA Flow DMA firewall rules (PCIe level)
 ├── GPU CC attestation verifier
-├── Audit logger
 └── BF-3 firmware config (self-hosted mode)
+
+Removed (replaced by foil-cilium):
+  ✗ OPA policy engine → CNPs with ibverbs rules
+  ✗ Custom audit logger → Hubble RDMA flow export
+  ✗ Standalone IPsec config → Cilium transparent encryption
+  ✗ Custom RDMA access control → CNP default-deny
 ```
 
 Flash: `bfb-install --bfb dynamo-zt-appliance.bfb --rshim /dev/rshim0`
 
 Boot sequence:
 1. Secure boot → measured boot → DICE cert chain
-2. DOCA Flow default-deny rules loaded in NIC firmware
-3. IPsec SAs negotiated with peer BF-3 nodes (IKEv2 + DICE keys)
-4. SPIRE agent registers, gets SVID from SPIRE server
-5. GPU CC attestation verified (SPDM session)
-6. OPA policy engine loaded with default-deny + explicit allows
+2. DOCA Flow default-deny rules loaded in NIC firmware (PCIe DMA level)
+3. K3s starts → foil-cilium CNI initializes
+4. CNP default-deny applied (no RDMA until explicitly allowed)
+5. foil-cilium IPsec SAs negotiated with peer BF-3 nodes
+6. SPIRE agent registers, gets SVID → Cilium picks up SPIFFE identity
 7. Dynamo services start (control plane + inference workers)
 8. Node joins inference cluster via authenticated discovery
 
@@ -258,13 +327,54 @@ Prompt journey:
                                         host compromise = game over
 ```
 
-### After (BF-3 SH Zero-Trust Appliance)
+### After (BF-3 SH Zero-Trust Appliance with foil-cilium)
 ```
 Prompt journey:
-  User → mTLS → BF-3 → OPA policy check → SPIFFE ID verified →
-  IPsec encrypt → ConnectX-7 → DOCA Flow firewall → GPU TEE →
-  decrypt in CPR → inference → encrypt result → BF-3 → mTLS → User
+  User → mTLS → BF-3 K3s pod → CNP policy check → SPIFFE verified →
+  foil-cilium IPsec encrypt → ConnectX-7 → Hubble records flow →
+  DOCA Flow DMA firewall → GPU TEE → decrypt in CPR → inference →
+  encrypt result → BF-3 → Hubble records response → mTLS → User
 
   Every hop authenticated. Every byte encrypted. Every action authorized.
-  Default-deny. Hardware root of trust. No x86 in the path.
+  Every RDMA verb audited in Hubble. Default-deny CNPs.
+  Hardware root of trust. No x86 in the path.
+```
+
+## Stack Summary
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  BF-3 SH Zero-Trust Inference Appliance                 │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │  K3s (lightweight K8s)                          │    │
+│  │  ├── foil-cilium (RDMA-aware CNI)               │    │
+│  │  │   ├── CNPs: default-deny + ibverbs policing  │    │
+│  │  │   ├── Hubble: RDMA flow audit + metrics      │    │
+│  │  │   ├── SPIFFE: mutual auth (DICE-backed)      │    │
+│  │  │   └── IPsec: encrypted RoCE v2               │    │
+│  │  │                                              │    │
+│  │  ├── Dynamo pods (control + inference)           │    │
+│  │  │   ├── Router, Frontend, KVBM (cores 0-3)    │    │
+│  │  │   └── SGLang worker (cores 4-13, GPU)        │    │
+│  │  │                                              │    │
+│  │  └── NIXL (UCX + GDAKI, KV cache RDMA)          │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │  DOCA (below K8s)                               │    │
+│  │  ├── DMA firewall (PCIe transaction filtering)  │    │
+│  │  └── GPU CC attestation verifier                │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │  Hardware                                       │    │
+│  │  ├── BF-3 DICE secure boot chain               │    │
+│  │  ├── ConnectX-7 (400Gb/s, crypto offload)       │    │
+│  │  └── GPU on PCIe root complex (CC TEE)          │    │
+│  └─────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+
+Note: foil-cilium is a custom fork, not upstream Cilium.
+RDMA/ibverbs awareness does not exist in upstream Cilium.
 ```
