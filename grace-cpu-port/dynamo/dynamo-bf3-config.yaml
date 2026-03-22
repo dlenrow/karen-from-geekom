@@ -203,19 +203,16 @@ dynamo:
           port: 8002
           require_client_cert: true
 
-    # Layer B: IPsec for inter-node RDMA (KV cache bulk transfer)
-    # Node-to-node, hardware-offloaded on ConnectX-7, high throughput.
-    # Not per-connection — encrypts the pipe between BF-3 nodes.
-    # Right encryption for bulk KV cache RDMA (WRITE/SEND at 400Gb/s).
+    # Layer B: RDMA dataplane — NO encryption
+    # CNPs isolate RDMA users (ibverbs policing, identity-based allow/deny).
+    # No need for IPsec/encryption on the dataplane:
+    #   - foil-cilium CNPs enforce who can RDMA to whom
+    #   - Physical fabric is 800G optical — nobody is sniffing it
+    #   - BF-3 DPU is the drop-in trust boundary — node-to-node
+    #     encryption is redundant when the NIC enforces policy
+    #   - IPsec burns ARM cores and adds latency for zero benefit
     encrypted_rdma:
-      enabled: true
-      # foil-cilium manages IPsec SAs between nodes
-      # ConnectX-7 hardware offloads AES-256-GCM
-      provider: "cilium"
-      reject_cleartext: true
-      # IPsec applies ONLY to inter-node RDMA (RoCE v2 / UDP 4791)
-      # mTLS handles the API path separately
-      scope: "rdma_only"
+      enabled: false
 
     # DMA firewall: DOCA Flow rules
     dma_firewall:

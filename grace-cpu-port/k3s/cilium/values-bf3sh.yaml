@@ -62,17 +62,11 @@ rdma:
   device: "mlx5_0"
 
 # --- Encryption ---
+# DISABLED. CNPs isolate RDMA users. Physical fabric is 800G optical.
+# BF-3 DPU is the trust boundary. Dataplane encryption burns CPU for
+# zero security gain. mTLS on the API path handles user↔TEE encryption.
 encryption:
-  # IPsec for RoCE v2 traffic encryption
-  enabled: true
-  type: "ipsec"
-  # Or WireGuard (lower overhead but less granular):
-  # type: "wireguard"
-  ipsec:
-    # AES-256-GCM (ConnectX-7 hardware offload)
-    keyFile: "/etc/cilium/ipsec-keys"
-    # Interface for encrypted traffic
-    interface: "mlx5_0"
+  enabled: false
 
 # --- Identity / mTLS ---
 authentication:

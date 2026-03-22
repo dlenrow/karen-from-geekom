@@ -175,18 +175,26 @@ Client ──[mTLS/TLS 1.3]──► BF-3 Frontend (port 8000)
   │ Prompt encrypted to service identity, not just to node
   │ Client cert carries tenant claims, individually revocable
   │
-BF-3 ──[IPsec, ConnectX HW offload]──► BF-3 (RDMA KV cache)
-  │ Bulk: node-to-node, 400Gb/s, hardware AES-256-GCM
-  │ No per-request overhead, ibverbs policed by CNPs
+BF-3 ──[CNP-isolated, cleartext]──► BF-3 (RDMA KV cache)
+  │ foil-cilium CNPs enforce who can RDMA to whom (ibverbs level)
+  │ No dataplane encryption — 800G optical fabric, no sniffing risk
+  │ Zero CPU overhead, zero added latency
 ```
 
-**Why mTLS for API, not IPsec:**
-- Per-connection identity (SPIFFE SVID) vs per-node SA
+**Why mTLS for API:**
+- Per-connection identity (SPIFFE SVID), per-turn auth
 - L7 visibility — Cilium/Envoy can inspect HTTP method/path/headers
 - Per-tenant rate limiting keyed on client cert
 - Individual revocation without tearing down all traffic
 - Hubble records who asked what (metadata, not content)
-- Client attestation via cert claims
+
+**Why NO encryption on RDMA dataplane:**
+- CNPs isolate RDMA users at ibverbs level — access control is the real need
+- BF-3 DPU is the drop-in trust boundary — it IS the enforcement point
+- 800G optical fabric — nobody is sniffing it
+- IPsec/WireGuard burns ARM cores and adds latency for zero security gain
+- Encryption is not a substitute for access control, and access control
+  is not a substitute for encryption. Here only access control matters.
 
 ## Security Layers
 
@@ -196,8 +204,8 @@ BF-3 ──[IPsec, ConnectX HW offload]──► BF-3 (RDMA KV cache)
 | 2. Identity | SPIFFE/SPIRE + DICE certs | foil-cilium mTLS |
 | 3. Network Policy | foil-cilium CNPs (default-deny) | eBPF on representor ports |
 | 4. RDMA Policy | foil-cilium ibverbs policing | eBPF datapath |
-| 5. API Encryption | mTLS / TLS 1.3 (per-connection) | Cilium L7 proxy |
-| 6. RDMA Encryption | IPsec (Cilium + ConnectX HW offload) | NIC hardware |
+| 5. API Encryption | mTLS / TLS 1.3 (per-turn, to TEE) | Cilium L7 proxy |
+| 6. RDMA Dataplane | CNP isolation (no encryption) | eBPF datapath |
 | 7. DMA Firewall | DOCA Flow rules | NIC firmware |
 | 8. GPU Protection | CC TEE (H200 CPR) | GPU hardware |
 | 9. Observability | Hubble (L7 + RDMA flows) + Prometheus | eBPF datapath |

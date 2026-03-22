@@ -4,6 +4,28 @@ Reverse-chronological log of architectural decisions and pivots.
 
 ---
 
+## 2026-03-22: No dataplane encryption — CNPs isolate, fabric is optical
+
+**Question:** Do we need encrypted RDMA dataplane?
+
+**Decision:** No. Disabled IPsec/WireGuard on the RDMA dataplane entirely.
+
+**Rationale:**
+- foil-cilium CNPs isolate RDMA users at ibverbs level — that's the real
+  security control (who can talk to whom, with which verbs)
+- BF-3 DPU IS the drop-in trust boundary — node-to-node encryption is
+  redundant when the NIC card enforces policy
+- Physical fabric is 800G optical — nobody is sniffing it
+- IPsec burns scarce ARM cores (8 on BF-2, 16 on BF-3) and adds latency
+  for zero security benefit in this threat model
+- mTLS on the API path (user ↔ frontend ↔ GPU TEE) handles the
+  encryption that actually matters — identity-bound, per-turn
+
+**What still encrypts:** mTLS on inference API (port 8000). That's it.
+**What doesn't encrypt:** Inter-node RDMA (KV cache), control plane inter-service.
+
+---
+
 ## 2026-03-22: mTLS for inference API, IPsec for RDMA bulk
 
 **Question:** What encryption for user ↔ GPU TEE inference turns?

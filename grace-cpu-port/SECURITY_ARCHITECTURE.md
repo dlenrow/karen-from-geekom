@@ -166,29 +166,41 @@ TARGET STATE (SECURE):
 └────────────────────────────────────────────────────────────────┘
 ```
 
-### Layer 4: Encrypted RDMA — foil-cilium + DOCA IPsec
+### Layer 4: Transport Security — mTLS for API, CNP Isolation for RDMA
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│        Encrypted RDMA (foil-cilium IPsec + ConnectX-7 HW)      │
+│              Transport Security (Two Paths)                     │
 │                                                                │
-│  Two options (both enforced by foil-cilium):                   │
+│  PATH A: Inference API (user ↔ frontend ↔ GPU TEE)             │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  mTLS / TLS 1.3                                          │  │
+│  │  • Client presents SPIFFE SVID (identity-bound)           │  │
+│  │  • Per-turn authentication                                │  │
+│  │  • L7 visible to Cilium (method, path, headers)           │  │
+│  │  • Per-tenant rate limiting on client cert                 │  │
+│  │  • Individual revocation without disrupting other clients  │  │
+│  │  • Hubble audits: who asked what (metadata, NOT prompts)   │  │
+│  │  • Prompt encrypted from client to TEE boundary            │  │
+│  └──────────────────────────────────────────────────────────┘  │
 │                                                                │
-│  Option A: foil-cilium transparent IPsec                       │
-│  • Cilium manages IPsec SAs between nodes                      │
-│  • ConnectX-7 hardware offloads AES-256-GCM                    │
-│  • Applied per-identity (SPIFFE SVID keying)                   │
-│  • RoCE v2 packets encrypted before hitting wire               │
+│  PATH B: RDMA Dataplane (inter-node KV cache transfer)         │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  NO encryption — CNP isolation only                       │  │
+│  │  • foil-cilium CNPs enforce who can RDMA to whom          │  │
+│  │  • ibverbs policing: allow WRITE/SEND, deny ATOMIC        │  │
+│  │  • BF-3 DPU is the trust boundary (drop-in device)        │  │
+│  │  • 800G optical fabric — no sniffing risk                  │  │
+│  │  • Zero CPU overhead, zero added latency                   │  │
+│  │  • Encryption is not access control. CNPs ARE.             │  │
+│  └──────────────────────────────────────────────────────────┘  │
 │                                                                │
-│  Option B: DOCA IPsec inline (standalone)                      │
-│  • Direct DOCA API for SA management                           │
-│  • Full 400Gb/s line rate AES-256-GCM                          │
-│  • IKEv2 with DICE-derived identity keys                       │
-│                                                                │
-│  Either way:                                                   │
-│  Before:  Prompt ──[cleartext RDMA]──► GPU                     │
-│  After:   Prompt ──[AES-256-GCM ESP]──► BF-3 ──[PCIe]──► GPU  │
-│                                                                │
-│  Hubble shows encryption_status per flow — alerts on cleartext │
+│  Why no dataplane encryption:                                  │
+│  • IPsec burns ARM cores for zero security gain                │
+│  • The threat is unauthorized access, not eavesdropping        │
+│  • CNPs solve unauthorized access at ibverbs level             │
+│  • Physical fabric is optical — tap requires physical splice   │
+│  • If adversary has physical access to splice 800G fiber,      │
+│    you have bigger problems than RDMA encryption               │
 └────────────────────────────────────────────────────────────────┘
 ```
 
