@@ -1,0 +1,97 @@
+# GPU inference workers — these run on GPU nodes (x86 or Grace Blackwell)
+# They connect to the BF-3 control plane for routing and KV cache management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamo-prefill-workers
+  namespace: dynamo-inference
+  labels:
+    app: dynamo
+    component: prefill-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dynamo
+      component: prefill-worker
+  template:
+    metadata:
+      labels:
+        app: dynamo
+        component: prefill-worker
+        dynamo.nvidia.com/role: "prefill"
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: prefill
+          image: nvcr.io/nvidia/dynamo:latest
+          command: ["dynamo-worker"]
+          args:
+            - "--role=prefill"
+            - "--engine=sglang"
+            - "--control-plane=dynamo-control-plane.dynamo-inference.svc:9100"
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              cpu: "8"
+              memory: "32Gi"
+            limits:
+              nvidia.com/gpu: "1"
+              cpu: "16"
+              memory: "64Gi"
+          env:
+            - name: NIXL_METADATA_BACKEND
+              value: "kubernetes"
+            - name: UCX_NET_DEVICES
+              value: "mlx5_0:1"
+            - name: UCX_TLS
+              value: "rc_mlx5,cuda_copy,cuda_ipc"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamo-decode-workers
+  namespace: dynamo-inference
+  labels:
+    app: dynamo
+    component: decode-worker
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: dynamo
+      component: decode-worker
+  template:
+    metadata:
+      labels:
+        app: dynamo
+        component: decode-worker
+        dynamo.nvidia.com/role: "decode"
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: decode
+          image: nvcr.io/nvidia/dynamo:latest
+          command: ["dynamo-worker"]
+          args:
+            - "--role=decode"
+            - "--engine=sglang"
+            - "--control-plane=dynamo-control-plane.dynamo-inference.svc:9100"
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              nvidia.com/gpu: "1"
+              cpu: "8"
+              memory: "32Gi"
+          env:
+            - name: NIXL_METADATA_BACKEND
+              value: "kubernetes"
+            - name: UCX_NET_DEVICES
+              value: "mlx5_0:1"
+            - name: UCX_TLS
+              value: "rc_mlx5,cuda_copy,cuda_ipc"

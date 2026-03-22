@@ -1,0 +1,105 @@
+# Dynamo control plane configuration for BF-3 Grace CPU deployment
+# This runs the control plane (router, planner, KVBM) on the BF-3's Grace CPU
+# while inference workers run on GPU nodes
+
+dynamo:
+  # Cluster identity
+  cluster_name: "bf3-disagg-inference"
+
+  # --- Frontend ---
+  frontend:
+    host: "0.0.0.0"
+    port: 8000
+    # Accept requests on BF-3's network interface
+    # Clients connect to BF-3 IP for inference requests
+    max_concurrent_requests: 1024
+    timeout_s: 300
+
+  # --- Router (runs on BF-3 Grace CPU) ---
+  router:
+    type: "kv_aware"
+    # KV-aware routing optimizes cache hit rates
+    config:
+      # Prefix-based routing for cache locality
+      prefix_aware: true
+      # Load-aware balancing across decode workers
+      load_balancing: "least_loaded"
+      # Route prefill to dedicated prefill GPUs
+      disaggregated: true
+      # Sticky sessions for multi-turn conversations
+      session_affinity: true
+      session_ttl_s: 600
+
+  # --- Planner / Autoscaler (runs on BF-3 Grace CPU) ---
+  planner:
+    enabled: true
+    config:
+      # SLA targets
+      target_ttft_ms: 200      # Time to first token
+      target_tpot_ms: 30       # Time per output token
+      target_throughput_rps: 100
+      # Scaling bounds
+      min_prefill_workers: 1
+      max_prefill_workers: 8
+      min_decode_workers: 2
+      max_decode_workers: 16
+      # Scaling interval
+      check_interval_s: 10
+      scale_up_threshold: 0.8
+      scale_down_threshold: 0.3
+      cooldown_s: 60
+
+  # --- KV Block Manager (runs on BF-3 Grace CPU) ---
+  kvbm:
+    # Manage KV cache across the memory hierarchy
+    tiers:
+      - name: "gpu_hbm"
+        type: "vram"
+        # Managed by workers, KVBM tracks allocation
+      - name: "grace_dram"
+        type: "host"
+        # Grace CPU LPDDR5X — high bandwidth KV cache spillover
+        capacity_gb: 64
+        path: "/dev/hugepages"
+      - name: "nvme"
+        type: "storage"
+        # Local NVMe on BF-3 for cold KV cache
+        capacity_gb: 512
+        path: "/mnt/bf3-nvme"
+
+    # NIXL handles actual data movement between tiers
+    nixl:
+      config_path: "/etc/nixl/nixl-bf3-config.yaml"
+
+  # --- Discovery Plane ---
+  discovery:
+    # For K8s deployment
+    backend: "kubernetes"
+    # For standalone / bare-metal
+    # backend: "kv_store"
+    # etcd:
+    #   endpoints: ["http://localhost:2379"]
+
+  # --- Request Plane ---
+  request_plane:
+    transport: "tcp"
+    # BF-3 has direct network access — low latency to workers
+    bind_address: "0.0.0.0"
+    port: 8001
+
+  # --- Event Plane ---
+  event_plane:
+    transport: "zmq"
+    bind_address: "0.0.0.0"
+    port: 8002
+    serialization: "msgpack"
+
+  # --- Worker configuration (reference — these run on GPU nodes, not BF-3) ---
+  workers:
+    prefill:
+      engine: "sglang"  # or "vllm", "trtllm"
+      # Workers connect back to BF-3 control plane
+      control_plane_address: "${BF3_IP}:8001"
+    decode:
+      engine: "sglang"
+      control_plane_address: "${BF3_IP}:8001"

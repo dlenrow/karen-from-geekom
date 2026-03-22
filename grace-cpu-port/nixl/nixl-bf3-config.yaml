@@ -1,0 +1,59 @@
+# NIXL configuration for BF-3 Grace CPU deployment
+# Optimized for ConnectX-7 RDMA and Grace CPU memory hierarchy
+
+nixl:
+  # Agent configuration for BF-3
+  agent:
+    name: "bf3-nixl-agent"
+
+  # Backend selection — prioritize ConnectX-7 RDMA
+  backends:
+    - type: ucx
+      priority: 1
+      config:
+        # ConnectX-7 on BF-3 — use RDMA RC transport
+        net_devices: "mlx5_0:1"
+        tls: "rc_mlx5,cuda_copy"
+        # Enable adaptive routing for multi-path
+        ib_ar_enable: true
+        # Rendezvous threshold for large KV cache blocks
+        rndv_thresh: 8192
+        # Memory registration cache
+        rcache_enable: true
+
+    - type: posix
+      priority: 2
+      config:
+        # Fallback for local file-based transfers
+        base_path: "/tmp/nixl"
+
+  # Memory registration for Grace CPU
+  memory:
+    # Grace LPDDR5X — register host memory for RDMA
+    host_mem:
+      type: "DRAM"
+      registration: "on_init"
+
+    # GPU HBM — if GPUs are accessible from BF-3
+    gpu_mem:
+      type: "VRAM"
+      registration: "on_demand"
+
+  # ETCD for metadata exchange (optional, for standalone mode)
+  metadata:
+    backend: "etcd"
+    endpoints:
+      - "http://localhost:2379"
+    prefix: "/nixl/bf3/"
+    ttl: 30
+
+  # Performance tuning for BF-3
+  tuning:
+    # Number of concurrent transfers
+    max_concurrent_ops: 64
+    # Completion queue depth
+    cq_depth: 256
+    # Pre-registered buffer pool size (MB)
+    buffer_pool_mb: 512
+    # Use huge pages on Grace for better TLB performance
+    use_hugepages: true

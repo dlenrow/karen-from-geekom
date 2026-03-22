@@ -1,0 +1,136 @@
+# Connection Manager configuration for BF-3 Grace CPU
+# Manages Discovery, Request, and Event planes for disaggregated inference
+#
+# In Dynamo v0.9.0+, the "connection manager" is the combination of:
+#   1. Discovery Plane — service registration & discovery
+#   2. Request Plane  — inter-service RPC (TCP transport)
+#   3. Event Plane    — pub/sub events (ZMQ + MessagePack)
+#
+# On BF-3, the connection manager runs on Grace CPU and serves as the
+# central coordination point for all inference workers on GPU nodes.
+
+# --- Discovery Plane ---
+# How workers find each other and the control plane
+discovery:
+  # Use Kubernetes-native discovery in K8s environments
+  # Uses EndpointSlices instead of etcd (Dynamo v0.8.0+)
+  backend: "kubernetes"
+
+  kubernetes:
+    # BF-3 nodes labeled for control plane scheduling
+    namespace: "dynamo-inference"
+    label_selector: "dynamo.nvidia.com/role=control-plane"
+    # Watch EndpointSlices for worker registration
+    watch_timeout_s: 30
+
+  # Standalone / bare-metal fallback
+  # Uncomment below and comment out kubernetes section above
+  # backend: "kv_store"
+  # etcd:
+  #   endpoints:
+  #     - "http://127.0.0.1:2379"
+  #   # Run etcd directly on BF-3 Grace CPU
+  #   auth:
+  #     enabled: false
+  #   prefix: "/dynamo/bf3/"
+  #   lease_ttl_s: 15
+  #   keepalive_interval_s: 5
+
+# --- Request Plane ---
+# Inter-service messaging for routing decisions and KV cache coordination
+request_plane:
+  transport: "tcp"
+
+  tcp:
+    # BF-3 Grace CPU listens for worker connections
+    bind_address: "0.0.0.0"
+    port: 9100
+    # Connection pool per worker
+    max_connections_per_peer: 4
+    # Keepalive for long-lived worker connections
+    keepalive_interval_s: 10
+    keepalive_timeout_s: 30
+    # TCP_NODELAY for low-latency routing decisions
+    nodelay: true
+
+  # Request timeout for routing decisions
+  timeout_ms: 5000
+  # Max in-flight requests
+  max_pending: 4096
+
+# --- Event Plane ---
+# Pub/sub for system events (scaling, health, metrics)
+event_plane:
+  transport: "zmq"
+
+  zmq:
+    bind_address: "0.0.0.0"
+    # PUB socket for broadcasting events
+    pub_port: 9200
+    # SUB socket for receiving worker events
+    sub_port: 9201
+    # High-water mark (messages buffered before dropping)
+    hwm: 10000
+    # IO threads for ZMQ (Grace CPU has plenty of cores)
+    io_threads: 4
+
+  serialization: "msgpack"
+
+  # Event types managed
+  events:
+    - type: "worker.health"
+      interval_s: 5
+    - type: "worker.metrics"
+      interval_s: 10
+    - type: "kv_cache.eviction"
+      # Immediate notification
+    - type: "scaling.request"
+    - type: "routing.update"
+
+# --- BF-3 Specific Network Configuration ---
+bf3_network:
+  # Primary interface — ConnectX-7 400Gb/s
+  data_interface: "mlx5_0"
+  # Management interface
+  mgmt_interface: "tmfifo_net0"
+
+  # RDMA configuration for NIXL data path
+  rdma:
+    enabled: true
+    # RoCE v2 for Ethernet fabrics
+    gid_index: 3
+    # Traffic class for QoS
+    traffic_class: 106
+    # MTU — jumbo frames for KV cache blocks
+    mtu: 4096
+
+  # BF-3 ARM host networking
+  host_network:
+    # BF-3 internal representor ports
+    # Connect to host PCIe for GPU access
+    representor_ports:
+      - "pf0hpf"   # Host PF representor
+      - "pf0vf0"   # VF representors for GPU workers
+
+# --- Health & Monitoring ---
+health:
+  # Health check endpoint on BF-3
+  endpoint: "0.0.0.0:9300"
+
+  checks:
+    - name: "discovery_plane"
+      interval_s: 10
+    - name: "request_plane"
+      interval_s: 5
+    - name: "event_plane"
+      interval_s: 10
+    - name: "nixl_agent"
+      interval_s: 15
+    - name: "bf3_rdma"
+      interval_s: 30
+
+  # Prometheus metrics
+  metrics:
+    enabled: true
+    port: 9400
+    path: "/metrics"

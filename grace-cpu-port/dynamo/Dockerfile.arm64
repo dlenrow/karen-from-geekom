@@ -1,0 +1,66 @@
+# Dynamo Control Plane ARM64 container for BF-3 Grace CPU
+# Builds ONLY the control plane components (no GPU inference backends)
+#
+# Build: docker buildx build --platform linux/arm64 -t dynamo-cp:arm64 -f Dockerfile.arm64 .
+
+FROM rust:1.83-bookworm AS rust-builder
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler libprotobuf-dev \
+    libhwloc-dev libudev-dev libssl-dev \
+    libzmq3-dev pkg-config cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+RUN git clone --depth 1 https://github.com/ai-dynamo/dynamo.git
+WORKDIR /opt/dynamo
+
+# Build control plane Rust binaries
+RUN cargo build --release 2>&1 || true
+# Individual component builds as fallback
+RUN for pkg in dynamo-router dynamo-planner dynamo-frontend dynamo-kvbm; do \
+        cargo build --release -p "$pkg" 2>/dev/null || true; \
+    done
+
+# --- Python build stage ---
+FROM python:3.11-bookworm AS python-builder
+
+WORKDIR /opt
+COPY --from=rust-builder /opt/dynamo /opt/dynamo
+WORKDIR /opt/dynamo
+
+RUN pip install --no-cache-dir setuptools wheel maturin patchelf
+RUN pip install --no-cache-dir -e ".[core]" 2>/dev/null || pip install --no-cache-dir -e . || true
+
+# --- NIXL build stage (reuse from nixl Dockerfile or pre-built) ---
+FROM nixl:arm64 AS nixl
+
+# --- Runtime ---
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y \
+    libhwloc15 libudev1 libzmq5 libprotobuf32 \
+    libibverbs1 librdmacm1 libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# NIXL runtime
+COPY --from=nixl /opt/nixl /opt/nixl
+COPY --from=nixl /opt/ucx /opt/ucx
+
+# Dynamo binaries
+COPY --from=rust-builder /opt/dynamo/target/release/dynamo-* /opt/dynamo/bin/
+
+# Python packages
+COPY --from=python-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+
+ENV PATH="/opt/dynamo/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/nixl/lib:/opt/ucx/lib:${LD_LIBRARY_PATH}"
+ENV PYTHONPATH="/opt/nixl/lib/python3/dist-packages:${PYTHONPATH}"
+
+# Default: BF-3 ConnectX-7 RDMA settings
+ENV UCX_NET_DEVICES=mlx5_0:1
+ENV UCX_TLS=rc_mlx5,cuda_copy
+
+EXPOSE 8000 8001
+
+ENTRYPOINT ["/bin/bash"]
