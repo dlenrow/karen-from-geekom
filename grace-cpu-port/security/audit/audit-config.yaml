@@ -1,0 +1,92 @@
+# Audit Logger Configuration for BF-3 SH Zero-Trust Inference
+# Logs ALL security-relevant events from the BF-3 control plane.
+# Events are tamper-resistant (signed with BF-3 DICE key).
+
+audit:
+  # Log destination
+  log_path: "/var/log/dynamo/audit"
+  max_log_size_mb: 512
+  rotation: "daily"
+  retention_days: 90
+  compression: true
+
+  # Tamper protection: sign audit entries with BF-3 DICE key
+  signing:
+    enabled: true
+    key_path: "/etc/ipsec/bf3-dice-identity.key"
+    algorithm: "ECDSA-P256-SHA256"
+    # Hash chain: each entry includes hash of previous entry
+    hash_chain: true
+
+  # Events to audit
+  events:
+    # === Security Events (ALWAYS logged) ===
+    security:
+      # Authentication
+      - "auth.spiffe.svid_issued"
+      - "auth.spiffe.svid_expired"
+      - "auth.spiffe.svid_revoked"
+      - "auth.mtls.connection_established"
+      - "auth.mtls.connection_rejected"
+      - "auth.dice.attestation_verified"
+      - "auth.dice.attestation_failed"
+
+      # Authorization (OPA policy decisions)
+      - "authz.policy.allow"
+      - "authz.policy.deny"
+      - "authz.policy.error"
+
+      # RDMA / DMA firewall
+      - "firewall.rdma.connection_allowed"
+      - "firewall.rdma.connection_denied"
+      - "firewall.dma.write_allowed"
+      - "firewall.dma.write_denied"
+      - "firewall.dma.read_denied"
+      - "firewall.packet.dropped"
+
+      # IPsec
+      - "ipsec.sa.established"
+      - "ipsec.sa.rekeyed"
+      - "ipsec.sa.expired"
+      - "ipsec.sa.failed"
+      - "ipsec.replay_attack_detected"
+
+      # GPU attestation
+      - "gpu.attestation.passed"
+      - "gpu.attestation.failed"
+      - "gpu.attestation.expired"
+      - "gpu.cc_mode.changed"
+
+    # === Operational Events ===
+    operational:
+      - "inference.request.submitted"
+      - "inference.request.completed"
+      - "inference.request.rejected"
+      - "kvcache.transfer.started"
+      - "kvcache.transfer.completed"
+      - "model.loaded"
+      - "model.unloaded"
+      - "node.joined"
+      - "node.left"
+      - "node.health.degraded"
+
+  # DOCA Flow counter export
+  doca_counters:
+    enabled: true
+    interval_seconds: 10
+    counters:
+      - "dma_firewall_drops"
+      - "ingress_denied"
+      - "rdma_atomic_denied"
+      - "dma_denied"
+      - "unencrypted_egress_denied"
+      - "ipsec_esp_packets"
+      - "gpudirect_write"
+      - "gpudirect_read"
+
+  # Remote syslog export (optional)
+  # syslog:
+  #   enabled: true
+  #   target: "syslog.management.svc:514"
+  #   protocol: "tcp+tls"
+  #   tls_cert: "/run/spire/svids/audit-logger.pem"

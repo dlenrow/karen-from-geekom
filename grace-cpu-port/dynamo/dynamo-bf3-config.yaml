@@ -1,10 +1,12 @@
-# Dynamo configuration for BF-3 SH (self-hosted) — FULL STACK
+# Dynamo configuration for BF-3 SH (self-hosted) — ZERO-TRUST FULL STACK
 # BF-3 ARM cores run EVERYTHING: control plane + inference workers + CUDA
 # GPU is on BF-3's PCIe root complex, no x86 host
 #
+# SECURITY: Default-deny, mTLS, encrypted RDMA, DMA firewall, GPU attestation
+#
 # CPU Budget (16 ARM A78 cores):
 #   Cores 0-1:   Dynamo control plane (router, frontend, KVBM)
-#   Cores 2-3:   Connection manager (ZMQ, TCP) + NIXL agent
+#   Cores 2-3:   Connection manager (ZMQ, TCP) + NIXL agent + OPA + SPIRE
 #   Cores 4-13:  Inference worker (SGLang/vLLM CPU threads)
 #   Cores 14-15: OS, IRQs, RDMA completions
 
@@ -146,3 +148,64 @@ dynamo:
     max_host_memory_gb: 28  # Leave 4GB for OS
     # GPU memory managed by inference engine
     max_gpu_memory_fraction: 0.90
+
+  # ============================================================
+  # SECURITY LAYER — Zero-Trust Controls
+  # ============================================================
+
+  security:
+    # Policy engine: OPA with default-deny
+    policy:
+      engine: "opa"
+      endpoint: "http://localhost:8181/v1/data/dynamo/inference/allow"
+      policy_path: "/etc/opa/policies"
+      # Every inference request evaluated against policy
+      enforce_on:
+        - "inference.submit"
+        - "kvcache.transfer"
+        - "rdma.connect"
+        - "gpu.dma"
+        - "model.load"
+      # Cache policy decisions for performance (short TTL)
+      decision_cache_ttl_ms: 100
+
+    # Identity: SPIFFE/SPIRE
+    identity:
+      provider: "spiffe"
+      workload_api_socket: "/run/spire/sockets/agent.sock"
+      trust_domain: "inference.cluster.local"
+      # mTLS for all inter-node communication
+      mtls:
+        enabled: true
+        # SVID used as client/server cert for all connections
+        require_peer_svid: true
+
+    # Encrypted RDMA: DOCA IPsec inline
+    encrypted_rdma:
+      enabled: true
+      config_path: "/etc/ipsec/doca-ipsec-config.yaml"
+      # Reject unencrypted RDMA connections
+      reject_cleartext: true
+
+    # DMA firewall: DOCA Flow rules
+    dma_firewall:
+      enabled: true
+      config_path: "/etc/doca/flow/doca-flow-rules.yaml"
+      # Default action for unlisted traffic
+      default_action: "DROP"
+
+    # GPU CC attestation: verify before inference
+    gpu_attestation:
+      enabled: true
+      verifier_script: "/opt/dynamo-appliance/scripts/gpu-cc-verifier.sh"
+      # Re-attest periodically
+      reattestation_interval_seconds: 3600
+      # Block inference if attestation fails
+      block_on_failure: true
+
+    # Audit logging
+    audit:
+      enabled: true
+      config_path: "/etc/dynamo/audit/audit-config.yaml"
+      # Sign audit entries with BF-3 DICE key
+      signed: true

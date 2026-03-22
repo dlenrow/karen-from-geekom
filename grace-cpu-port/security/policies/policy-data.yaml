@@ -1,0 +1,55 @@
+# OPA Policy Data — deployed alongside default-deny.rego
+# This is the CONFIGURATION for the zero-trust policy engine.
+# Customize per deployment.
+
+# Authorized tenants per model
+authorized_tenants:
+  "meta-llama/Llama-3.1-8B":
+    - "tenant-alpha"
+    - "tenant-beta"
+  "meta-llama/Llama-3.1-70B":
+    - "tenant-alpha"
+  "*":  # wildcard model
+    - "tenant-admin"
+
+# Rate limits per tenant (requests per minute)
+rate_limits:
+  "tenant-alpha":
+    requests_per_minute: 100
+    max_batch_size: 32
+    max_sequence_length: 8192
+  "tenant-beta":
+    requests_per_minute: 50
+    max_batch_size: 16
+    max_sequence_length: 4096
+  "tenant-admin":
+    requests_per_minute: 1000
+    max_batch_size: 64
+    max_sequence_length: 32768
+
+# RDMA queue pair limit per peer node
+rdma_qp_limit: 16
+
+# Permitted DMA regions per tenant
+# Restricts which GPU memory regions a tenant can write to
+permitted_dma_regions:
+  "tenant-alpha":
+    - "inference_input"
+    - "kv_cache"
+  "tenant-beta":
+    - "inference_input"
+  "tenant-admin":
+    - "inference_input"
+    - "kv_cache"
+    - "model_weights"
+
+# Trusted model signers (public key fingerprints)
+trusted_signers:
+  - "sha256:abc123...model-signing-key-1"
+  - "sha256:def456...model-signing-key-2"
+
+# Blacklisted identities (immediate deny)
+blacklist: []
+
+# Revoked peer nodes (previously trusted, now denied)
+revoked_peers: []
