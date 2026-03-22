@@ -24,13 +24,18 @@ Reverse-chronological log of architectural decisions and pivots.
 - foil-cilium CNP isolation on BF-4 = same security, no crypto tax
 - Customers choose: 10% CPU + latency (Vera) vs 0% (Cilium on BF-4)
 
-**Strategic position:**
-- Build on BF-2 (home lab) → deploy on BF-3 (HGX installed base)
-  → productize on BF-4 (next gen, native RDMA CNP support)
-- foil-cilium proves the model on BF-2/3, becomes the reference
-  implementation for BF-4 native RDMA security
-- NVIDIA has incentive to adopt: makes their $5T hardware more
-  competitive vs Vera's software-only approach that taxes GPU customers
+**Go-to-market: enterprise security channel, not NVIDIA**
+- NVIDIA sells silicon, not security posture. They don't GAF.
+- Enterprise buys zero-trust from security vendors:
+  - Illumio (microsegmentation, already has enterprise ZT brand)
+    + WWT (channel, integration, enterprise delivery)
+  - Microsoft (Azure Confidential Computing, Defender for Cloud)
+- Solution sold as: "zero-trust inference security for your GPU cluster"
+  - Not "BlueField firmware update" — enterprise security product
+  - Illumio/WWT: on-prem and colo HGX deployments
+  - Microsoft: Azure GPU fleet, sovereign cloud
+- BFB appliance is the deliverable, but packaging is enterprise security
+- foil-cilium is the engine, but branding is the vendor's ZT platform
 
 ---
 
