@@ -49,6 +49,14 @@ Reverse-chronological log of architectural decisions and pivots.
 - $600M NV AI Factory spend = massive unprotected RDMA attack surface
   = urgency for the same CISO who already bought Illumio
 
+**WWT as channel:**
+- WWT sells tons of Illumio Core already — established relationship
+- WWT does enterprise integration / delivery for HGX deployments
+- Natural attach: "you're deploying AI Factory, here's the security"
+- WWT already in the room for the GPU infrastructure sale
+- Illumio Core (east-west IP) + this (RDMA fabric) = complete ZT story
+- WWT margin on BFB appliance licensing + integration services
+
 ---
 
 ## 2026-03-22: Competitive positioning vs Vera CC (10% CPU + latency)
