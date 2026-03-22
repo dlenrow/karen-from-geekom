@@ -40,13 +40,13 @@ Reverse-chronological log of architectural decisions and pivots.
 **Microsoft path (strongest):**
 - Microsoft owns 2M Illumio licenses — already protects their IP estate
 - Same CISO who signed that PO will sign PO to protect RDMA estate
-- Microsoft has $600M in NVIDIA AI Factory commitments next 12 months
+- Microsoft has $600B in NVIDIA AI Factory commitments next 12 months
 - Land: "you already protect east-west with Illumio. Your GPU fabric
   is wide open. Same threat model, same vendor, same CISO budget."
 - Expand: every AI Factory node gets a BFB flash — per-node licensing
 - Scale: 2M Illumio licenses → establishes trust + procurement path
   → RDMA protection is natural extension of existing ZT posture
-- $600M NV AI Factory spend = massive unprotected RDMA attack surface
+- $600B NV AI Factory spend = massive unprotected RDMA attack surface
   = urgency for the same CISO who already bought Illumio
 
 **WWT as channel:**
