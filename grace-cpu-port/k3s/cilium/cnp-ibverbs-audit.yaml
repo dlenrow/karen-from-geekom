@@ -1,0 +1,92 @@
+# CiliumNetworkPolicy: ibverbs Operation Audit and Rate Limiting
+# Uses foil-cilium's ibverbs-level visibility for deep RDMA auditing.
+#
+# This policy doesn't block — it creates Hubble flow records for
+# every RDMA operation type, enabling forensic analysis and anomaly
+# detection on the inference cluster's RDMA fabric.
+
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: ibverbs-audit-all
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "rdma"
+    security.dynamo.nvidia.com/policy: "audit"
+  annotations:
+    # foil-cilium: enable deep ibverbs inspection for Hubble
+    policy.cilium.io/rdma-audit: "verbose"
+    policy.cilium.io/hubble-export: "true"
+spec:
+  description: "Audit all ibverbs operations via Hubble"
+  endpointSelector:
+    matchLabels:
+      app: dynamo
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: dynamo
+      toPorts:
+        - ports:
+            - port: "4791"
+              protocol: UDP
+          rules:
+            rdma:
+              # Log all verb types for audit trail
+              audit:
+                - verb: "RDMA_WRITE"
+                  action: "log"
+                  rateLimit: "0"   # No rate limit on audit
+                - verb: "RDMA_READ"
+                  action: "log"
+                  rateLimit: "0"
+                - verb: "SEND"
+                  action: "log"
+                  rateLimit: "0"
+                - verb: "RECV"
+                  action: "log"
+                  rateLimit: "0"
+                # Alert on atomics (should not occur in normal inference)
+                - verb: "ATOMIC_CMP_AND_SWP"
+                  action: "alert"
+                - verb: "ATOMIC_FETCH_AND_ADD"
+                  action: "alert"
+
+---
+# CiliumNetworkPolicy: RDMA Rate Limiting per Tenant
+# Prevents resource exhaustion / denial-of-service on RDMA fabric.
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: rdma-rate-limit
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "rdma"
+    security.dynamo.nvidia.com/policy: "rate-limit"
+spec:
+  description: "Rate limit RDMA operations per source identity"
+  endpointSelector:
+    matchLabels:
+      app: dynamo
+      component: bf3sh-node
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: dynamo
+      toPorts:
+        - ports:
+            - port: "4791"
+              protocol: UDP
+          rules:
+            rdma:
+              # Rate limit RDMA WRITE operations (KV cache blocks)
+              rateLimit:
+                verb: "RDMA_WRITE"
+                # Max 10k WRITE ops/sec per source (tunable)
+                maxOpsPerSecond: 10000
+                burstSize: 1000
+              # Rate limit SEND operations (control messages)
+              rateLimit:
+                verb: "SEND"
+                maxOpsPerSecond: 5000
+                burstSize: 500

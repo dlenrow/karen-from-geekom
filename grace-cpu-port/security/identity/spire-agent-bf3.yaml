@@ -1,0 +1,111 @@
+# SPIRE Agent configuration for BF-3 SH
+# Provides SPIFFE identity to all services running on BF-3 ARM cores.
+# Uses BF-3 DICE certificate chain as the hardware attestation source.
+
+agent:
+  # Trust domain for the inference cluster
+  trust_domain: "inference.cluster.local"
+
+  # SPIRE server (runs on a management node, NOT on inference BF-3s)
+  server_address: "${SPIRE_SERVER_ADDR:-spire-server.management.svc:8081}"
+  server_port: 8081
+
+  # Socket for workloads to request SVIDs
+  socket_path: "/run/spire/sockets/agent.sock"
+
+  # Data directory
+  data_dir: "/var/lib/spire/agent"
+
+  # Log
+  log_level: "INFO"
+  log_file: "/var/log/spire/agent.log"
+
+  # --- BF-3 DICE Attestation ---
+  # BF-3 hardware DICE certificate chain used for node attestation.
+  # The SPIRE server verifies:
+  #   1. DICE cert chain roots to NVIDIA's manufacturing CA
+  #   2. Boot measurements match expected values
+  #   3. Firmware versions are approved
+  #   4. BF-3 is in self-hosted (root complex) mode
+  node_attestation:
+    - type: "bf3_dice"
+      config:
+        # DICE certificate chain from BF-3 hardware
+        dice_cert_path: "/sys/firmware/dice/cert_chain.pem"
+        # BF-3 device serial (from manufacturing)
+        device_serial_path: "/sys/devices/platform/bf3_info/serial"
+        # Boot measurement register values
+        boot_measurements_path: "/sys/firmware/dice/measurements"
+        # Verify BF-3 is in self-hosted mode
+        require_self_hosted: true
+
+  # --- Workload Attestation ---
+  # How SPIRE identifies workloads running on the BF-3
+  workload_attestation:
+    - type: "unix"
+      config:
+        # Match by process UID/GID and binary path
+        discover_workload_path: "/opt/dynamo/bin"
+    - type: "docker"
+      config:
+        # If running in containers
+        docker_socket_path: "/var/run/docker.sock"
+
+  # --- SVIDs (Identity Certificates) ---
+  # These are the identities that services on BF-3 will receive
+  svids:
+    # Dynamo control plane
+    - spiffe_id: "spiffe://inference.cluster.local/bf3/control-plane"
+      selectors:
+        - type: "unix"
+          value: "path:/opt/dynamo/bin/dynamo-router"
+        - type: "unix"
+          value: "path:/opt/dynamo/bin/dynamo-frontend"
+
+    # Inference workers
+    - spiffe_id: "spiffe://inference.cluster.local/bf3/inference-worker"
+      selectors:
+        - type: "unix"
+          value: "path:/opt/dynamo/bin/dynamo-serve"
+
+    # NIXL agent (RDMA transfers)
+    - spiffe_id: "spiffe://inference.cluster.local/bf3/nixl-agent"
+      selectors:
+        - type: "unix"
+          value: "path:/opt/nixl/bin/nixl-agent"
+
+  # --- mTLS ---
+  # All inter-node communication uses mTLS with SPIFFE SVIDs
+  mtls:
+    # Automatically rotate SVIDs
+    svid_ttl: "1h"
+    # Bundle refresh interval
+    bundle_refresh_interval: "5m"
+    # Minimum RSA key size
+    min_key_size: 2048
+    # Prefer ECDSA P-256 for lower overhead on ARM
+    key_type: "ec-p256"
+
+---
+# SPIRE Server Registration Entries for BF-3 SH nodes
+# Run these on the SPIRE server to authorize BF-3 nodes
+
+# Register BF-3 node identity
+# spire-server entry create \
+#   -parentID "spiffe://inference.cluster.local/bf3/node" \
+#   -spiffeID "spiffe://inference.cluster.local/bf3/${NODE_ID}" \
+#   -selector "bf3_dice:serial:${BF3_SERIAL}" \
+#   -selector "bf3_dice:firmware_version:${FW_VERSION}" \
+#   -selector "bf3_dice:self_hosted:true"
+
+# Register control plane workload
+# spire-server entry create \
+#   -parentID "spiffe://inference.cluster.local/bf3/${NODE_ID}" \
+#   -spiffeID "spiffe://inference.cluster.local/bf3/control-plane" \
+#   -selector "unix:path:/opt/dynamo/bin/dynamo-router"
+
+# Register inference worker workload
+# spire-server entry create \
+#   -parentID "spiffe://inference.cluster.local/bf3/${NODE_ID}" \
+#   -spiffeID "spiffe://inference.cluster.local/bf3/inference-worker" \
+#   -selector "unix:path:/opt/dynamo/bin/dynamo-serve"

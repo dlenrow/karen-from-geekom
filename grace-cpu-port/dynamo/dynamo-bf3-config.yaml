@@ -1,0 +1,240 @@
+# Dynamo configuration for BF-3 SH (self-hosted) — ZERO-TRUST FULL STACK
+# BF-3 ARM cores run EVERYTHING: control plane + inference workers + CUDA
+# GPU is on BF-3's PCIe root complex, no x86 host
+#
+# SECURITY: Default-deny, mTLS, encrypted RDMA, DMA firewall, GPU attestation
+#
+# CPU Budget (16 ARM A78 cores):
+#   Cores 0-1:   Dynamo control plane (router, frontend, KVBM)
+#   Cores 2-3:   Connection manager (ZMQ, TCP) + NIXL agent + OPA + SPIRE
+#   Cores 4-13:  Inference worker (SGLang/vLLM CPU threads)
+#   Cores 14-15: OS, IRQs, RDMA completions
+
+dynamo:
+  cluster_name: "bf3sh-inference"
+
+  # --- Frontend ---
+  frontend:
+    host: "0.0.0.0"
+    port: 8000
+    max_concurrent_requests: 256  # Conservative for 16 cores
+    timeout_s: 300
+    # Pin to core 1
+    cpu_affinity: "1"
+
+  # --- Router ---
+  router:
+    type: "kv_aware"
+    config:
+      prefix_aware: true
+      load_balancing: "least_loaded"
+      disaggregated: true
+      session_affinity: true
+      session_ttl_s: 600
+    # Pin to core 0
+    cpu_affinity: "0"
+
+  # --- Planner / Autoscaler ---
+  planner:
+    # Disable for single-node — enable for multi-node BF-3 cluster
+    enabled: false
+    # enabled: true
+    # config:
+    #   target_ttft_ms: 200
+    #   target_tpot_ms: 30
+    #   min_prefill_workers: 1
+    #   max_decode_workers: 4
+    #   check_interval_s: 30  # Less frequent — save CPU
+
+  # --- KV Block Manager ---
+  kvbm:
+    tiers:
+      # Tier 0: GPU HBM — fastest, limited capacity
+      - name: "gpu_hbm"
+        type: "vram"
+        # Managed via CUDA on ARM cores
+
+      # Tier 1: BF-3 DDR5 — KV cache spillover
+      # ~80 GB/s bandwidth, much less than GPU HBM but usable
+      - name: "bf3_ddr5"
+        type: "host"
+        capacity_gb: 24  # Leave 8GB for OS + processes
+        hugepage_path: "/dev/hugepages"
+
+      # Tier 2: NVMe (optional, if attached to BF-3 PCIe)
+      # - name: "nvme"
+      #   type: "storage"
+      #   capacity_gb: 512
+      #   path: "/mnt/bf3-nvme"
+
+    nixl:
+      config_path: "/etc/nixl/nixl-bf3-config.yaml"
+
+    # Pin to core 0 (shares with router — both event-driven)
+    cpu_affinity: "0"
+
+  # --- Inference Workers (run on BF-3 ARM cores, use GPU via CUDA) ---
+  workers:
+    prefill:
+      engine: "sglang"  # Lower CPU overhead than vLLM
+      # engine: "vllm"
+      gpu_devices: [0]  # Single GPU on PCIe root complex
+      # Pin worker CPU threads to cores 4-13
+      cpu_affinity: "4-13"
+      config:
+        # Conservative settings for 16 ARM cores
+        max_batch_size: 32
+        # Offload tokenizer to GPU if supported
+        # Limit CPU-side preprocessing
+        num_cpu_threads: 8
+
+    decode:
+      engine: "sglang"
+      gpu_devices: [0]
+      cpu_affinity: "4-13"
+      config:
+        max_batch_size: 64
+        num_cpu_threads: 8
+
+    # Single-node mode: prefill + decode on same GPU
+    # Multi-node: disaggregate across BF-3 SH nodes
+    mode: "colocated"  # or "disaggregated" for multi-node
+
+  # --- Discovery Plane ---
+  discovery:
+    # Single node: file-based (no external deps)
+    backend: "file"
+    file:
+      path: "/var/run/dynamo/discovery.json"
+
+    # Multi-node: etcd running on one BF-3 node
+    # backend: "kv_store"
+    # etcd:
+    #   endpoints: ["http://bf3-node-1:2379"]
+
+    # K8s cluster of BF-3 nodes:
+    # backend: "kubernetes"
+
+  # --- Request Plane ---
+  request_plane:
+    transport: "tcp"
+    bind_address: "0.0.0.0"
+    port: 8001
+    # Pin to core 2
+    cpu_affinity: "2"
+
+  # --- Event Plane ---
+  event_plane:
+    transport: "zmq"
+    bind_address: "0.0.0.0"
+    port: 8002
+    serialization: "msgpack"
+    # Pin to core 3
+    cpu_affinity: "3"
+
+  # --- CUDA / GPU Configuration ---
+  gpu:
+    # GPU is on BF-3 PCIe root complex
+    cuda_visible_devices: "0"
+    # Verify GPU is accessible from ARM cores
+    verify_on_startup: true
+    # PCIe Gen5 x16 to GPU
+    expected_pcie_width: 16
+    expected_pcie_gen: 5
+
+  # --- Resource Limits ---
+  resources:
+    # Total system memory budget (BF-3 DDR5)
+    max_host_memory_gb: 28  # Leave 4GB for OS
+    # GPU memory managed by inference engine
+    max_gpu_memory_fraction: 0.90
+
+  # ============================================================
+  # SECURITY LAYER — Zero-Trust Controls
+  # ============================================================
+
+  security:
+    # Policy enforcement: foil-cilium CNPs (not OPA)
+    # RDMA default-deny and ibverbs policing enforced in eBPF datapath
+    # by foil-cilium CNPs. No userspace policy engine needed.
+    policy:
+      engine: "cilium-cnp"
+      # CNPs deployed via K8s manifests:
+      #   cnp-rdma-default-deny.yaml  — default DENY all RoCE v2
+      #   cnp-ibverbs-audit.yaml      — audit + rate limit ibverbs
+      # Dynamo respects CNP enforcement at the network level.
+      # Application-level auth handled by SPIFFE mTLS below.
+
+    # Identity: SPIFFE/SPIRE
+    identity:
+      provider: "spiffe"
+      workload_api_socket: "/run/spire/sockets/agent.sock"
+      trust_domain: "inference.cluster.local"
+
+    # --- Transport Security (two layers) ---
+
+    # Layer A: mTLS for inference API path (user ↔ frontend ↔ GPU TEE)
+    # Per-connection identity, per-turn auth, L7 visible to Hubble/Envoy.
+    # Client presents SPIFFE SVID — identity-bound, revocable, carries claims.
+    # This is the right encryption for LLM conversation turns over HTTP API.
+    mtls:
+      enabled: true
+      # SVID used as client/server cert for all API connections
+      require_peer_svid: true
+      # Minimum TLS version
+      min_version: "1.3"
+      # Cipher suites (TLS 1.3 — all use AEAD)
+      cipher_suites:
+        - "TLS_AES_256_GCM_SHA384"
+        - "TLS_CHACHA20_POLY1305_SHA256"
+      # Client certificate verification
+      client_auth: "require_and_verify"
+      # Apply to these endpoints:
+      endpoints:
+        # Inference API — every turn is mTLS authenticated
+        - service: "frontend"
+          port: 8000
+          require_client_cert: true
+        # Control plane inter-service
+        - service: "request_plane"
+          port: 8001
+          require_client_cert: true
+        - service: "event_plane"
+          port: 8002
+          require_client_cert: true
+
+    # Layer B: RDMA dataplane — NO encryption
+    # CNPs isolate RDMA users (ibverbs policing, identity-based allow/deny).
+    # No need for IPsec/encryption on the dataplane:
+    #   - foil-cilium CNPs enforce who can RDMA to whom
+    #   - Physical fabric is 800G optical — nobody is sniffing it
+    #   - BF-3 DPU is the drop-in trust boundary — node-to-node
+    #     encryption is redundant when the NIC enforces policy
+    #   - IPsec burns ARM cores and adds latency for zero benefit
+    encrypted_rdma:
+      enabled: false
+
+    # DMA firewall: DOCA Flow rules
+    dma_firewall:
+      enabled: true
+      config_path: "/etc/doca/flow/doca-flow-rules.yaml"
+      # Default action for unlisted traffic
+      default_action: "DROP"
+
+    # GPU CC attestation: verify before inference
+    gpu_attestation:
+      enabled: true
+      verifier_script: "/opt/dynamo-appliance/scripts/gpu-cc-verifier.sh"
+      # Re-attest periodically
+      reattestation_interval_seconds: 3600
+      # Block inference if attestation fails
+      block_on_failure: true
+
+    # Audit: Hubble RDMA flow records (replaces custom audit)
+    audit:
+      enabled: true
+      # foil-cilium Hubble provides RDMA flow audit automatically
+      # via CNP verdicts + ibverbs metadata in flow records
+      provider: "hubble"
+      # DOCA DMA firewall counters exported separately
+      doca_counters: true

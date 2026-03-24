@@ -1,0 +1,214 @@
+# CiliumNetworkPolicy: Default-Deny for RDMA / RoCE v2 Traffic
+# Uses foil-cilium's RDMA-aware CNP extensions.
+#
+# DEFAULT: Deny all RDMA ingress/egress.
+# Explicit allow rules in separate CNPs permit specific flows.
+#
+# On BF-3 SH, foil-cilium sees RoCE v2 as UDP/4791 on representor
+# ports, plus ibverbs operation metadata.
+
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: rdma-default-deny
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "rdma"
+    security.dynamo.nvidia.com/policy: "default-deny"
+spec:
+  description: "Default deny all RDMA/RoCE v2 traffic"
+  endpointSelector: {}   # Applies to ALL pods in namespace
+  ingress:
+    # Deny all RoCE v2 ingress (UDP 4791)
+    - toPorts:
+        - ports:
+            - port: "4791"
+              protocol: UDP
+          rules: {}      # No rules = deny
+  egress:
+    # Deny all RoCE v2 egress
+    - toPorts:
+        - ports:
+            - port: "4791"
+              protocol: UDP
+          rules: {}
+
+---
+# CiliumNetworkPolicy: Default-Deny for ALL traffic (L3/L4 baseline)
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "network"
+    security.dynamo.nvidia.com/policy: "default-deny"
+spec:
+  description: "Default deny all ingress and egress"
+  endpointSelector: {}
+  ingress: []
+  egress: []
+
+---
+# CiliumNetworkPolicy: Allow RDMA KV Cache Transfer Between Inference Nodes
+# Only attested BF-3 SH nodes with matching cluster identity can
+# exchange KV cache blocks via RDMA.
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-rdma-kvcache
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "rdma"
+    security.dynamo.nvidia.com/policy: "kvcache-transfer"
+spec:
+  description: "Allow RDMA KV cache transfer between attested inference nodes"
+  endpointSelector:
+    matchLabels:
+      app: dynamo
+      component: bf3sh-node
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: dynamo
+            component: bf3sh-node
+            # foil-cilium: require mutual SPIFFE authentication
+            io.cilium.spiffe/authenticated: "true"
+      toPorts:
+        - ports:
+            - port: "4791"
+              protocol: UDP
+          # foil-cilium: ibverbs-level rules
+          rules:
+            rdma:
+              # Only allow WRITE and SEND for KV cache transfer
+              # Block READ and ATOMIC (not needed for NIXL KV transfer)
+              allowedVerbs:
+                - "RDMA_WRITE"
+                - "RDMA_WRITE_WITH_IMM"
+                - "SEND"
+                - "SEND_WITH_IMM"
+              deniedVerbs:
+                - "RDMA_READ"
+                - "ATOMIC_CMP_AND_SWP"
+                - "ATOMIC_FETCH_AND_ADD"
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: dynamo
+            component: bf3sh-node
+            io.cilium.spiffe/authenticated: "true"
+      toPorts:
+        - ports:
+            - port: "4791"
+              protocol: UDP
+          rules:
+            rdma:
+              allowedVerbs:
+                - "RDMA_WRITE"
+                - "RDMA_WRITE_WITH_IMM"
+                - "SEND"
+                - "SEND_WITH_IMM"
+
+---
+# CiliumNetworkPolicy: Allow Dynamo Control Plane Traffic
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-dynamo-control-plane
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "control-plane"
+spec:
+  description: "Allow Dynamo control plane inter-node communication"
+  endpointSelector:
+    matchLabels:
+      app: dynamo
+      component: bf3sh-node
+  ingress:
+    # Frontend (inference API)
+    - fromEndpoints:
+        - matchLabels:
+            io.cilium.spiffe/authenticated: "true"
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+    # Request plane
+    - fromEndpoints:
+        - matchLabels:
+            app: dynamo
+            component: bf3sh-node
+      toPorts:
+        - ports:
+            - port: "8001"
+              protocol: TCP
+    # Event plane (ZMQ)
+    - fromEndpoints:
+        - matchLabels:
+            app: dynamo
+            component: bf3sh-node
+      toPorts:
+        - ports:
+            - port: "8002"
+              protocol: TCP
+    # Metrics (Prometheus)
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "9400"
+              protocol: TCP
+  egress:
+    # Allow outbound to other Dynamo nodes
+    - toEndpoints:
+        - matchLabels:
+            app: dynamo
+            component: bf3sh-node
+      toPorts:
+        - ports:
+            - port: "8001"
+              protocol: TCP
+            - port: "8002"
+              protocol: TCP
+    # DNS
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+          rules:
+            dns:
+              - matchPattern: "*.dynamo-inference.svc.cluster.local"
+
+---
+# CiliumNetworkPolicy: Deny Inference API from Unauthenticated Sources
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: deny-unauthenticated-inference
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "api"
+    security.dynamo.nvidia.com/policy: "authentication"
+spec:
+  description: "Block inference requests without SPIFFE identity"
+  endpointSelector:
+    matchLabels:
+      app: dynamo
+      component: bf3sh-node
+  ingress:
+    - fromEndpoints:
+        - matchExpressions:
+            - key: "io.cilium.spiffe/authenticated"
+              operator: "NotIn"
+              values: ["true"]
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+          # Deny action (foil-cilium or Cilium 1.14+ deny policies)

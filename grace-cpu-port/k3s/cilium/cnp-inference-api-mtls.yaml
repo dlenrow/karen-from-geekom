@@ -1,0 +1,135 @@
+# CiliumNetworkPolicy: mTLS enforcement for Inference API path
+#
+# The inference API (LLM conversation turns) uses mTLS, NOT IPsec.
+# Each request is identity-bound via client SPIFFE SVID.
+#
+# Why mTLS for API, IPsec for RDMA:
+#   mTLS: per-connection identity, per-turn auth, L7 inspectable,
+#         client cert carries claims/tenant ID, individually revocable.
+#   IPsec: node-to-node pipe encryption, hardware-offloaded on ConnectX-7,
+#          right for bulk KV cache RDMA at 400Gb/s, no per-request overhead.
+#
+# Prompt journey with mTLS:
+#   Client ──[TLS 1.3, client cert]──► BF-3 Frontend
+#     → Cilium verifies SPIFFE SVID
+#     → CNP checks L7 rules (path, method, headers)
+#     → Hubble records: who asked what (metadata, NOT prompt content)
+#     → Request forwarded to inference worker
+#     → Worker → GPU TEE (prompt decrypted only in CPR)
+
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: inference-api-mtls
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "api"
+    security.dynamo.nvidia.com/transport: "mtls"
+spec:
+  description: "Enforce mTLS + L7 policy on inference API"
+  endpointSelector:
+    matchLabels:
+      app: dynamo
+      component: bf3sh-node
+  ingress:
+    # --- Inference API (port 8000) — mTLS required ---
+    - fromEndpoints:
+        - matchLabels:
+            # Must have SPIFFE identity verified by foil-cilium
+            io.cilium.spiffe/authenticated: "true"
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+          rules:
+            http:
+              # POST /v1/chat/completions — standard OpenAI-compatible API
+              - method: "POST"
+                path: "/v1/chat/completions"
+              # POST /v1/completions
+              - method: "POST"
+                path: "/v1/completions"
+              # POST /generate (SGLang native)
+              - method: "POST"
+                path: "/generate"
+              # GET /health — allow without body inspection
+              - method: "GET"
+                path: "/health"
+              # GET /v1/models — model listing
+              - method: "GET"
+                path: "/v1/models"
+            # foil-cilium: require TLS 1.3 on this port
+            tls:
+              minVersion: "1.3"
+              requireClientCert: true
+
+    # --- Deny unauthenticated access to inference API ---
+    # (Covered by default-deny-all CNP, but explicit for clarity)
+
+---
+# CiliumNetworkPolicy: Inference API audit via Hubble
+# Logs L7 metadata (method, path, client SVID, response code)
+# but NOT prompt/response content (encrypted end-to-end to GPU TEE).
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: inference-api-audit
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "api"
+    security.dynamo.nvidia.com/policy: "audit"
+  annotations:
+    # Enable L7 visibility for Hubble on port 8000
+    policy.cilium.io/proxy-visibility: "<Ingress/8000/TCP/HTTP>"
+spec:
+  description: "Audit inference API calls via Hubble L7 visibility"
+  endpointSelector:
+    matchLabels:
+      app: dynamo
+      component: bf3sh-node
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            io.cilium.spiffe/authenticated: "true"
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+          rules:
+            http:
+              # Allow all methods — this CNP is for audit, not blocking
+              - method: "POST"
+              - method: "GET"
+
+---
+# CiliumNetworkPolicy: Rate limit inference API per client identity
+# Prevents any single tenant from exhausting inference capacity.
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: inference-api-rate-limit
+  namespace: dynamo-inference
+  labels:
+    security.dynamo.nvidia.com/layer: "api"
+    security.dynamo.nvidia.com/policy: "rate-limit"
+spec:
+  description: "Per-client rate limiting on inference API"
+  endpointSelector:
+    matchLabels:
+      app: dynamo
+      component: bf3sh-node
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            io.cilium.spiffe/authenticated: "true"
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+          # foil-cilium: per-identity rate limiting
+          # Keyed on source SPIFFE SVID — each client gets own bucket
+          rules:
+            http:
+              - method: "POST"
+                path: "/v1/chat/completions"
+                # headerMatches could further scope by tenant

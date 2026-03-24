@@ -1,0 +1,193 @@
+# DOCA Flow DMA Firewall Rules for BF-3 SH
+# Controls ALL traffic between ConnectX-7, GPU, and external network.
+# Loaded into ConnectX-7 hardware flow tables — survives BF-3 Linux crashes.
+#
+# PRINCIPLE: DEFAULT DROP. Only explicitly allowed flows pass.
+
+doca_flow:
+  device: "mlx5_0"
+
+  # --- Root Table: Default DROP ---
+  tables:
+    - name: "root"
+      priority: 0
+      default_action: "DROP"
+      # Count dropped packets for audit
+      miss_counter: "dma_firewall_drops"
+
+    # --- Ingress: Network → BF-3 ---
+    - name: "ingress_network"
+      priority: 10
+      parent: "root"
+      rules:
+        # Allow IKEv2 for IPsec SA negotiation (UDP 500, 4500)
+        - match:
+            protocol: "UDP"
+            dst_port: [500, 4500]
+          action: "ALLOW"
+          counter: "ike_packets"
+
+        # Allow IPsec ESP (encrypted RDMA)
+        - match:
+            protocol: "ESP"
+          action: "ALLOW"
+          counter: "ipsec_esp_packets"
+          # Jump to decryption pipeline
+          next_table: "ipsec_decrypt"
+
+        # Allow SPIRE agent communication (from SPIRE server only)
+        - match:
+            protocol: "TCP"
+            dst_port: 8081
+            src_ip: "${SPIRE_SERVER_IP}"
+          action: "ALLOW"
+          counter: "spire_packets"
+
+        # DENY everything else from network
+        - match:
+            protocol: "*"
+          action: "DROP"
+          counter: "ingress_denied"
+
+    # --- After IPsec Decryption ---
+    - name: "ipsec_decrypt"
+      priority: 20
+      rules:
+        # Decrypted RoCE v2 RDMA → policy check
+        - match:
+            protocol: "UDP"
+            dst_port: 4791
+          action: "ALLOW"
+          next_table: "rdma_policy"
+          counter: "rdma_decrypted"
+
+        # Decrypted control plane → BF-3 ARM cores
+        - match:
+            protocol: "TCP"
+            dst_port: [8000, 8001, 8002]
+          action: "ALLOW"
+          mark: "control_plane"
+          counter: "control_plane_decrypted"
+
+        # Everything else: DROP even if decrypted
+        - match:
+            protocol: "*"
+          action: "DROP"
+          counter: "post_decrypt_denied"
+
+    # --- RDMA Policy Table ---
+    - name: "rdma_policy"
+      priority: 30
+      rules:
+        # RDMA SEND — allowed (used for control messages)
+        - match:
+            rdma_opcode: "SEND"
+          action: "ALLOW"
+          counter: "rdma_send"
+          # Rate limit RDMA SENDs
+          meter:
+            rate_pps: 10000
+            burst: 1000
+
+        # RDMA WRITE — allowed to registered GPU memory regions only
+        # DOCA Flow can match on RDMA R_Key to restrict memory regions
+        - match:
+            rdma_opcode: "WRITE"
+          action: "ALLOW"
+          counter: "rdma_write"
+          # Steering: route through OPA policy check on ARM cores
+          mark: "requires_policy_check"
+
+        # RDMA READ — allowed from authenticated peers
+        - match:
+            rdma_opcode: "READ"
+          action: "ALLOW"
+          counter: "rdma_read"
+          mark: "requires_policy_check"
+
+        # RDMA ATOMIC — DENY (not needed for inference)
+        - match:
+            rdma_opcode: "ATOMIC_*"
+          action: "DROP"
+          counter: "rdma_atomic_denied"
+
+    # --- PCIe DMA Table (GPU ↔ ConnectX-7 P2P) ---
+    - name: "pcie_dma"
+      priority: 40
+      rules:
+        # Allow GPUDirect RDMA: ConnectX-7 → GPU HBM
+        # Only for decrypted, policy-checked RDMA writes
+        - match:
+            src_device: "mlx5_0"
+            dst_device: "${GPU_PCI_BDF}"
+            marked: "policy_approved"
+          action: "ALLOW"
+          counter: "gpudirect_write"
+
+        # Allow GPUDirect RDMA: GPU HBM → ConnectX-7
+        # For sending inference results back
+        - match:
+            src_device: "${GPU_PCI_BDF}"
+            dst_device: "mlx5_0"
+          action: "ALLOW"
+          counter: "gpudirect_read"
+
+        # Allow ARM cores → GPU (local CUDA)
+        - match:
+            src_device: "arm_complex"
+            dst_device: "${GPU_PCI_BDF}"
+          action: "ALLOW"
+          counter: "local_cuda"
+
+        # DENY all other DMA
+        - match:
+            src_device: "*"
+            dst_device: "*"
+          action: "DROP"
+          counter: "dma_denied"
+
+    # --- Egress: BF-3 → Network ---
+    - name: "egress_network"
+      priority: 50
+      rules:
+        # All outgoing traffic MUST be IPsec encrypted
+        # IPsec encrypt pipeline handles this
+        - match:
+            protocol: "*"
+            dst: "!local"
+            marked: "!ipsec_encrypted"
+          action: "DROP"
+          counter: "unencrypted_egress_denied"
+
+        # Allow encrypted egress
+        - match:
+            protocol: "ESP"
+          action: "ALLOW"
+          counter: "ipsec_egress"
+
+        # Allow IKEv2 (key exchange)
+        - match:
+            protocol: "UDP"
+            dst_port: [500, 4500]
+          action: "ALLOW"
+          counter: "ike_egress"
+
+  # --- Counters for Audit ---
+  counters:
+    export_interval_seconds: 10
+    export_target: "audit_logger"
+    counters:
+      - "dma_firewall_drops"
+      - "ike_packets"
+      - "ipsec_esp_packets"
+      - "ingress_denied"
+      - "rdma_decrypted"
+      - "rdma_send"
+      - "rdma_write"
+      - "rdma_read"
+      - "rdma_atomic_denied"
+      - "gpudirect_write"
+      - "gpudirect_read"
+      - "local_cuda"
+      - "dma_denied"
+      - "unencrypted_egress_denied"

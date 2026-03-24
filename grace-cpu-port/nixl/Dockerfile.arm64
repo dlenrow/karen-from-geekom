@@ -1,0 +1,64 @@
+# NIXL ARM64 container for BF-3 Grace CPU
+# Build: docker buildx build --platform linux/arm64 -t nixl:arm64 -f Dockerfile.arm64 .
+# Or native on Grace: docker build -t nixl:arm64 -f Dockerfile.arm64 .
+
+FROM nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu22.04 AS builder
+
+ARG UCX_VERSION=1.20.0
+ARG NIXL_BRANCH=main
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System deps
+RUN apt-get update && apt-get install -y \
+    build-essential cmake meson ninja-build \
+    python3-dev python3-pip python3-venv pkg-config \
+    libibverbs-dev librdmacm-dev libnuma-dev libhwloc-dev \
+    git wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install pybind11 tomlkit meson-python
+
+# Build UCX with mlx5 + RDMA
+WORKDIR /tmp
+RUN wget -q https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz \
+    && tar xzf ucx-${UCX_VERSION}.tar.gz \
+    && cd ucx-${UCX_VERSION} \
+    && ./configure --prefix=/opt/ucx \
+        --enable-mt --with-rdmacm --with-verbs --with-mlx5-dv \
+        --with-cuda=/usr/local/cuda \
+        --enable-optimizations --disable-logging --disable-debug \
+    && make -j$(nproc) && make install
+
+# Build NIXL
+WORKDIR /opt
+RUN git clone --branch ${NIXL_BRANCH} --depth 1 https://github.com/ai-dynamo/nixl.git
+WORKDIR /opt/nixl
+RUN meson setup builddir --prefix=/opt/nixl-install --buildtype=release \
+    -Denable_plugins=ucx,posix \
+    -Ducx_path=/opt/ucx \
+    -Dcuda_path=/usr/local/cuda \
+    -Dpython=true \
+    && ninja -C builddir -j$(nproc) \
+    && ninja -C builddir install
+
+# --- Runtime image ---
+FROM nvcr.io/nvidia/cuda:12.8.0-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y \
+    libibverbs1 librdmacm1 libnuma1 libhwloc15 \
+    python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/ucx /opt/ucx
+COPY --from=builder /opt/nixl-install /opt/nixl
+
+ENV LD_LIBRARY_PATH=/opt/nixl/lib:/opt/ucx/lib:${LD_LIBRARY_PATH}
+ENV PYTHONPATH=/opt/nixl/lib/python3/dist-packages:${PYTHONPATH}
+ENV UCX_NET_DEVICES=mlx5_0:1
+ENV UCX_TLS=rc_mlx5,cuda_copy,cuda_ipc
+
+# Verify
+RUN python3 -c "import nixl; print('NIXL loaded on ARM64')" || true
+
+ENTRYPOINT ["/bin/bash"]

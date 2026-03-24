@@ -1,0 +1,95 @@
+# NIXL configuration for BF-3 SH (self-hosted, root complex mode)
+# GPU is on BF-3's PCIe root complex — ARM cores are the CUDA host
+# ConnectX-7 and GPU share the same PCIe switch for GPUDirect RDMA P2P
+
+nixl:
+  agent:
+    name: "bf3sh-nixl-agent"
+
+  # Backend priority — GPU is local, ConnectX-7 is local
+  backends:
+    # Primary: UCX with RDMA for inter-node GPU↔GPU transfers
+    - type: ucx
+      priority: 1
+      config:
+        # ConnectX-7 integrated in BF-3
+        net_devices: "mlx5_0:1"
+        # RC for reliable RDMA, cuda_copy for GPU↔host, cuda_ipc N/A (single GPU)
+        tls: "rc_mlx5,cuda_copy"
+        # GPUDirect RDMA — ConnectX-7 reads/writes GPU HBM directly
+        # Works because both are on BF-3's PCIe root complex
+        gpu_direct_rdma: true
+        # Adaptive routing for multi-path fabrics
+        ib_ar_enable: true
+        # Large rendezvous threshold for KV cache blocks
+        rndv_thresh: 8192
+        # Memory registration cache
+        rcache_enable: true
+
+    # GDAKI: GPU-initiated RDMA via DOCA
+    # Viable because GPU is on BF-3's PCIe fabric
+    - type: gdaki
+      priority: 2
+      config:
+        # DOCA device — BF-3's ConnectX-7
+        doca_device: "mlx5_0"
+        # GPU PCIe BDF (bus:device.function) — set per system
+        gpu_pci_bdf: "${GPU_PCI_BDF:-0000:01:00.0}"
+
+    # POSIX fallback for file-based / NVMe tier
+    - type: posix
+      priority: 3
+      config:
+        base_path: "/mnt/bf3-nvme/nixl"
+
+  # Memory registration — all tiers accessible from BF-3 ARM cores
+  memory:
+    # GPU HBM — primary KV cache storage
+    # CUDA runtime on ARM cores manages this
+    gpu_mem:
+      type: "VRAM"
+      registration: "on_init"
+      # GPU is on PCIe root complex — visible to ARM cores
+      cuda_visible_devices: "0"
+
+    # BF-3 DDR5 — KV cache spillover tier
+    # 32GB max, ~80 GB/s bandwidth
+    host_mem:
+      type: "DRAM"
+      registration: "on_init"
+      # Use huge pages for better TLB on ARM A78
+      hugepage_size: "2M"
+
+    # NVMe storage — cold KV cache tier (if NVMe attached to BF-3)
+    storage_mem:
+      type: "STORAGE"
+      registration: "on_demand"
+      path: "/mnt/bf3-nvme"
+
+  # Metadata exchange
+  metadata:
+    # For multi-node: etcd on one of the BF-3 nodes
+    backend: "etcd"
+    endpoints:
+      - "http://localhost:2379"
+    prefix: "/nixl/bf3sh/"
+    ttl: 30
+
+  # Performance tuning for BF-3 SH (16 ARM A78 cores, limited CPU)
+  tuning:
+    # Conservative — don't starve inference workers
+    max_concurrent_ops: 32
+    cq_depth: 128
+    # Pre-registered buffer pool in DDR5 (MB)
+    buffer_pool_mb: 256
+    use_hugepages: true
+    # Pin NIXL completion threads to specific cores
+    cpu_affinity: "14-15"  # Last 2 cores for NIXL
+
+  # GPUDirect RDMA P2P verification
+  pcie:
+    # Both ConnectX-7 and GPU must be under BF-3 root complex
+    # Verify with: nvidia-smi topo -m
+    verify_p2p: true
+    # ACS must be disabled for P2P
+    require_acs_disabled: true
